@@ -15,6 +15,7 @@ $end_info$
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/map.h>
 
+#include <atomic>
 #include <cstdint>
 
 namespace FEXCore::CPU {
@@ -46,6 +47,10 @@ namespace CPU {
     size_t AllocatedSize; // including guard page; see UsableSize()
 
     fextl::unique_ptr<GuestToHostMap> LookupCache;
+
+    // Set once this generation has been superseded by a newer one and its lookup data was dropped
+    // (see ContextImpl::RetireOldCodeBuffers). The memory stays valid while any thread still references it.
+    bool Retired {false};
 
     CodeBuffer(size_t Size);
     CodeBuffer(const CodeBuffer&) = delete;
@@ -87,6 +92,15 @@ namespace CPU {
     FEXCore::ForkableUniqueMutex CodeBufferWriteMutex;
 
     virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+
+    // Set whenever a new generation replaces an existing one. Consumed by ContextImpl::RetireOldCodeBuffers,
+    // which runs outside of the compile path's shared CodeInvalidationMutex section.
+    std::atomic<bool> RetirePending {false};
+
+    // Returns the latest CodeBuffer without allocating one. May be nullptr before the first allocation.
+    CodeBuffer* GetLatestIfAllocated() const {
+      return Latest.get();
+    }
 
   private:
     fextl::shared_ptr<CodeBuffer> Latest;
@@ -176,6 +190,10 @@ namespace CPU {
     virtual void ClearRelocations() {}
 
     bool IsAddressInCodeBuffer(uintptr_t Address) const;
+
+    // Like IsAddressInCodeBuffer but only checks the generation that new code is being written to.
+    // Block links must only be recorded for callsites inside this generation.
+    bool IsAddressInCurrentCodeBuffer(uintptr_t Address) const;
 
     // Updates the CodeBuffer if needed and returns a reference to the old one.
     // The returned reference should be kept alive carefully to avoid early deletion of resources.

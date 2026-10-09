@@ -555,6 +555,13 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
+  // Only record links for callsites that live in the generation currently being written to. A block of an
+  // older generation may still execute (e.g. after returning from a signal handler); linking it would store a
+  // delinker for a callsite that outlives the generation's lookup data and its memory.
+  if (!static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->IsAddressInCurrentCodeBuffer(reinterpret_cast<uintptr_t>(Record))) {
+    return HostCode;
+  }
+
   // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;

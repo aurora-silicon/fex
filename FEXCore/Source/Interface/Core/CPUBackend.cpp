@@ -401,8 +401,15 @@ namespace CPU {
 
     auto Buffer = fextl::make_shared<CodeBuffer>(Size);
 
+    // Replacing an existing generation: ask for the older generations to be retired at the next safe point.
+    const bool Replacing = !!Latest;
+
     Latest = Buffer;
     LatestOffset = 0;
+
+    if (Replacing) {
+      RetirePending.store(true, std::memory_order_release);
+    }
 
     OnCodeBufferAllocated(Buffer);
 
@@ -434,14 +441,18 @@ namespace CPU {
   }
 
 
-  bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
-    auto CheckCodeBuffer = [](CodeBuffer& Buffer, uintptr_t Address) {
-      // The last page of the code buffer is protected, so we need to exclude it from the valid range
-      // when checking if the address is in the code buffer.
-      uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Buffer.Ptr) + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-      return (Address >= reinterpret_cast<uintptr_t>(Buffer.Ptr) && Address < LastPageAddr);
-    };
+  static bool CheckCodeBuffer(const CodeBuffer& Buffer, uintptr_t Address) {
+    // The last page of the code buffer is protected, so we need to exclude it from the valid range
+    // when checking if the address is in the code buffer.
+    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Buffer.Ptr) + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+    return (Address >= reinterpret_cast<uintptr_t>(Buffer.Ptr) && Address < LastPageAddr);
+  }
 
+  bool CPUBackend::IsAddressInCurrentCodeBuffer(uintptr_t Address) const {
+    return CheckCodeBuffer(*CurrentCodeBuffer, Address);
+  }
+
+  bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
     if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {
       return true;
     }
