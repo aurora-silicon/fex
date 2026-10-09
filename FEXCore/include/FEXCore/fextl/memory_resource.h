@@ -38,6 +38,13 @@ namespace pmr {
     explicit named_monotonic_page_buffer_resource(const char* Name)
       : Name {Name} {}
 
+    named_monotonic_page_buffer_resource(const named_monotonic_page_buffer_resource&) = delete;
+    named_monotonic_page_buffer_resource& operator=(const named_monotonic_page_buffer_resource&) = delete;
+
+    ~named_monotonic_page_buffer_resource() override {
+      release();
+    }
+
     void release() noexcept {
       for (auto& Iter : Buffers) {
         FEXCore::Allocator::VirtualFree(Iter.Buffer, Iter.BufferSize);
