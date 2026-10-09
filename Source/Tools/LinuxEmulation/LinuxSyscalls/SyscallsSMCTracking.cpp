@@ -42,51 +42,98 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
     return true;
   }
 
-  {
-    // Can't use the deferred signal lock in the SIGSEGV handler.
+  // Lock-order note: this handler used to keep VMATracking.Mutex (shared) held while calling
+  // TM.InvalidateGuestCodeRange, which takes ThreadCreationMutex and then CodeInvalidationMutex (unique).
+  // fork() takes CodeInvalidationMutex (unique) first and VMATracking.Mutex (write) second
+  // (SyscallHandler::LockBeforeFork), so two concurrent SMC faults plus one fork deadlocked:
+  //   fork: holds CodeInvalidationMutex, waits VMATracking(W)
+  //   SMC A: holds VMATracking(R) + ThreadCreationMutex, waits CodeInvalidationMutex
+  //   SMC B: holds VMATracking(R), waits ThreadCreationMutex
+  // The VMA lookup is now done first and released before invalidating. The unprotect callback re-validates
+  // the mapping under the VMA lock (taken after the invalidation locks, which matches every other path).
+  struct FaultRange {
+    uintptr_t Base;
+    bool Unprotect;
+  };
+  constexpr size_t MaxRangesPerPass = 32;
+  FaultRange Ranges[MaxRangesPerPass];
+  size_t NumRanges = 0;
+  size_t MirrorsToSkip = 0;
+  bool MoreMirrors = false;
+
+  auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
+    // Only unprotect if the page is still tracked as a writable mapping; a concurrent guest mprotect/munmap
+    // (serialized by the VMA write lock) may have changed that since the fault was looked up.
     auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);
-
-    auto VMATracking = &_SyscallHandler->VMATracking;
-
-    // If the write spans two pages, they will be flushed one at a time (generating two faults)
-    auto Entry = VMATracking->FindVMAEntry(FaultAddress);
-
-    // If an untracked address, or the mapping wasn't writable, it can't be handled here
-    if (Entry == VMATracking->VMAs.end() || !Entry->second.Prot.Writable) {
-      return false;
+    auto Entry = _SyscallHandler->VMATracking.FindVMAEntry(Start);
+    if (Entry == _SyscallHandler->VMATracking.VMAs.end() || !Entry->second.Prot.Writable) {
+      return;
     }
+    auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
+    LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
+  };
 
-    auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
+  do {
+    NumRanges = 0;
+    MoreMirrors = false;
+    {
+      // Can't use the deferred signal lock in the SIGSEGV handler.
+      auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);
 
-    auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
-      auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
-      LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
-    };
+      auto VMATracking = &_SyscallHandler->VMATracking;
 
-    if (Entry->second.Flags.Shared) {
-      LOGMAN_THROW_A_FMT(Entry->second.Resource, "VMA tracking error");
+      // If the write spans two pages, they will be flushed one at a time (generating two faults)
+      auto Entry = VMATracking->FindVMAEntry(FaultAddress);
 
-      auto Offset = FaultBase - Entry->first + Entry->second.Offset;
-
-      auto VMA = Entry->second.Resource->FirstVMA;
-      LOGMAN_THROW_A_FMT(VMA, "VMA tracking error");
-
-      // Flush all mirrors, remap the page writable as needed
-      do {
-        if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
-          auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
-
-          if (VMA->Prot.Writable) {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
-          } else {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
-          }
+      // If an untracked address, or the mapping wasn't writable, it can't be handled here
+      if (Entry == VMATracking->VMAs.end() || !Entry->second.Prot.Writable) {
+        if (MirrorsToSkip == 0) {
+          return false;
         }
-      } while ((VMA = VMA->ResourceNextVMA));
-    } else {
-      _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
+        // Mapping changed under us after a first pass already invalidated some mirrors; nothing more to do.
+        break;
+      }
+
+      auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
+
+      if (Entry->second.Flags.Shared) {
+        LOGMAN_THROW_A_FMT(Entry->second.Resource, "VMA tracking error");
+
+        auto Offset = FaultBase - Entry->first + Entry->second.Offset;
+
+        auto VMA = Entry->second.Resource->FirstVMA;
+        LOGMAN_THROW_A_FMT(VMA, "VMA tracking error");
+
+        // Collect all mirrors (in batches if there are very many), flush them below without holding the VMA lock.
+        size_t Index = 0;
+        do {
+          if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
+            if (Index++ < MirrorsToSkip) {
+              continue;
+            }
+            if (NumRanges == MaxRangesPerPass) {
+              MoreMirrors = true;
+              break;
+            }
+            Ranges[NumRanges++] = {Offset - VMA->Offset + VMA->Base, VMA->Prot.Writable};
+          }
+        } while ((VMA = VMA->ResourceNextVMA));
+        MirrorsToSkip += NumRanges;
+      } else {
+        Ranges[NumRanges++] = {FaultBase, true};
+      }
     }
 
+    for (size_t i = 0; i < NumRanges; ++i) {
+      if (Ranges[i].Unprotect) {
+        _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Ranges[i].Base, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
+      } else {
+        _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Ranges[i].Base, FEXCore::Utils::FEX_PAGE_SIZE);
+      }
+    }
+  } while (MoreMirrors);
+
+  {
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
 
     auto CTX = Thread->CTX;
