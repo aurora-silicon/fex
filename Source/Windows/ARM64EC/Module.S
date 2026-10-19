@@ -56,9 +56,14 @@ BeginSimulation:
 .global ExitFunctionEC
 ExitFunctionEC:
   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
+  // An FPCR write is costly even when it changes nothing, and this runs on every call out to native code, so only
+  // write it when one of the bits is actually set. NZCV is free here, it is clobbered below in any case.
   mrs x17, fpcr
-  and x17, x17, #~6 // NEP + AH
+  tst x17, #6 // NEP + AH
+  b.eq 1f
+  and x17, x17, #~6
   msr fpcr, x17
+1:
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
