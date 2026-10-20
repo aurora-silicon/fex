@@ -57,8 +57,6 @@ is_policy_branch() {
 	return 1
 }
 
-lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-
 CANON=
 ALLOW=()
 load_canonical() {
@@ -91,31 +89,28 @@ is_allowed() {
 # Print "mode type oid<TAB>path" for each violation in commit $1.
 # Print "missing<TAB>path" for each copy path that is absent (policy use).
 scan_commit() {
-	local commit=$1 mode type oid path base skip= c
+	local commit=$1 meta mode type oid path c
 	declare -A seen=()
+	# One awk pass picks the candidates: assistant files at any depth and
+	# assistant directories (whose contents are not listed separately).
 	while IFS=$'\t' read -r meta path; do
 		read -r mode type oid <<<"$meta"
-		if [ -n "$skip" ] && [ "${path#"$skip"/}" != "$path" ]; then continue; fi
-		skip=
-		base=$(lower "${path##*/}")
-		if [ "$type" = tree ]; then
-			if [[ $base =~ $DIR_RE ]] && ! is_allowed "$path"; then
-				printf '%s %s %s\t%s\n' "$mode" "$type" "$oid" "$path"
-				skip=$path
-			fi
-			continue
-		fi
-		[[ $base =~ $FILE_RE ]] || continue
-		[ "$path" = "$CANON_PATH" ] && continue
 		is_allowed "$path" && continue
-		if is_copy_path "$path"; then
-			seen[$path]=1
-			if [ -n "$CANON" ] && [ "$mode" = 100644 ] && [ "$oid" = "$CANON" ]; then
-				continue
+		if [ "$type" != tree ]; then
+			[ "$path" = "$CANON_PATH" ] && continue
+			if is_copy_path "$path"; then
+				seen[$path]=1
+				if [ -n "$CANON" ] && [ "$mode" = 100644 ] && [ "$oid" = "$CANON" ]; then
+					continue
+				fi
 			fi
 		fi
 		printf '%s %s %s\t%s\n' "$mode" "$type" "$oid" "$path"
-	done < <(git ls-tree -r -t --full-tree "$commit")
+	done < <(git ls-tree -r -t --full-tree "$commit" | FRE=$FILE_RE DRE=$DIR_RE awk -F'\t' '
+		skip != "" && index($2, skip "/") == 1 { next }
+		{ skip = ""; n = split($2, parts, "/"); base = tolower(parts[n]); split($1, m, " ") }
+		m[2] == "tree" { if (base ~ ENVIRON["DRE"]) { print; skip = $2 } next }
+		base ~ ENVIRON["FRE"] { print }')
 	for c in "${COPIES[@]}"; do
 		[ -z "${seen[$c]:-}" ] && printf 'missing\t%s\n' "$c"
 	done
