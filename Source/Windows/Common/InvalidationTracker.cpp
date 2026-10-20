@@ -61,6 +61,8 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
       if (EffectiveRWX) {
         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
         RWXIntervals.Insert(ProtInterval);
+      } else {
+        RWXIntervals.Remove(ProtInterval);
       }
       if (DEPDisabled && !HasExec) {
         DEPPromotedIntervals.Insert(ProtInterval);
