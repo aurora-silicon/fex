@@ -73,12 +73,20 @@ uint64_t GetDentsEmulation(int fd, T* dirp, uint32_t count) {
 
   // Now copy back in to the array we were given
   if (Result != -1) {
+    constexpr size_t InputNameOffset = offsetof(FEX::HLE::x64::linux_dirent_64, d_name);
+    const auto ValidRecord = [Result](const FEX::HLE::x64::linux_dirent_64* Record, uint64_t Offset) {
+      return Result - Offset > InputNameOffset && Record->d_reclen > InputNameOffset && Record->d_reclen <= Result - Offset;
+    };
+
     // If the outgoing d_ino is smaller than the incoming d_ino from the kernel
     // Then we need to check for overflow before writing any of the data back
     if constexpr (sizeof(decltype(FEX::HLE::x64::linux_dirent_64::d_ino)) > sizeof(decltype(T::d_ino))) {
       uint64_t TmpOffset = 0;
       while (TmpOffset < Result) {
         FEX::HLE::x64::linux_dirent_64* Tmp = (FEX::HLE::x64::linux_dirent_64*)(reinterpret_cast<uint64_t>(dirp) + TmpOffset);
+        if (!ValidRecord(Tmp, TmpOffset)) {
+          return -EIO;
+        }
         decltype(T::d_ino) Result_d_ino = Tmp->d_ino;
 
         if (Result_d_ino != Tmp->d_ino) {
@@ -92,42 +100,47 @@ uint64_t GetDentsEmulation(int fd, T* dirp, uint32_t count) {
     uint64_t Offset = 0;
     uint64_t TmpOffset = 0;
     size_t OffsetIndex = 1;
-    // With how the emulation occurs we will always return a smaller buffer than what was given to us.
-    // We need to be careful with the in-place translation that occurs here, the data returning to the guest is guaranteed to be smaller
-    // than the data returned by getdents64.
-    // This means FEX is guaranteed to /never/ fill the full getdents buffer to the guest, but we may temporarily use it all.
+    // Legacy records have the same size or are smaller than their getdents64
+    // counterparts, so conversion can compact the buffer in place.
     while (TmpOffset < Result) {
       T* Outgoing = (T*)(reinterpret_cast<uint64_t>(dirp) + Offset);
       FEX::HLE::x64::linux_dirent_64* Tmp = (FEX::HLE::x64::linux_dirent_64*)(reinterpret_cast<uint64_t>(dirp) + TmpOffset);
 
-      if (!Tmp->d_reclen) {
-        break;
+      if (!ValidRecord(Tmp, TmpOffset)) {
+        return -EIO;
       }
 
-      size_t NewRecLen = FEXCore::AlignUp(Tmp->d_reclen - (sizeof(std::remove_reference<decltype(*Tmp)>::type) - sizeof(*Outgoing)),
-                                          alignof(decltype(Tmp->d_ino)));
-      Outgoing->d_ino = Tmp->d_ino;
+      // Save the input fields before writing an overlapping output header or name.
+      const auto InputRecLen = Tmp->d_reclen;
+      const auto InputIno = Tmp->d_ino;
+      const auto InputOff = Tmp->d_off;
+      const auto InputType = Tmp->d_type;
+      const size_t NameCapacity = InputRecLen - InputNameOffset;
+      const size_t NameSize = strnlen(Tmp->d_name, NameCapacity);
+      if (NameSize == NameCapacity) {
+        return -EIO;
+      }
+      const size_t NameLength = NameSize + 1;
+      const size_t NewRecLen = FEXCore::AlignUp(offsetof(T, d_name) + NameLength + 1, sizeof(decltype(T::d_ino)));
+      Outgoing->d_ino = InputIno;
 
       // 32-bit getdents can't safely handle d_off
       // A safe way of emulating this is to just use an incrementing offset from 1
-      Outgoing->d_off = IncrementOffset ? OffsetIndex : Tmp->d_off;
-      size_t OffsetOfName = offsetof(std::remove_reference<decltype(*Tmp)>::type, d_name);
+      Outgoing->d_off = IncrementOffset ? OffsetIndex : InputOff;
       Outgoing->d_reclen = NewRecLen;
 
       // Copies null character as well
-      size_t NameLength = Tmp->d_reclen - OffsetOfName - 1;
       memmove(Outgoing->d_name, Tmp->d_name, NameLength);
 
       // Copy the hidden d_type flag
-      Outgoing->d_name[Outgoing->d_reclen - offsetof(T, d_name) - 1] = Tmp->d_type;
+      Outgoing->d_name[NewRecLen - offsetof(T, d_name) - 1] = InputType;
 
-      TmpOffset += Tmp->d_reclen;
+      TmpOffset += InputRecLen;
 
       if (FEX::HLE::_SyscallHandler->FM.IsProtectedFile(fd, Outgoing->d_ino)) {
         continue;
       }
 
-      // Outgoing is 5 bytes smaller
       Offset += NewRecLen;
 
       ++OffsetIndex;
