@@ -15,7 +15,9 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   : CTX {CTX}
   , Threads {Threads} {
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
-  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+  // Full checking validates every block's code before it runs, so it needs no
+  // page traps; leaving the pages writable also lets system calls write to them.
+  SMCDetectionDisabled = (SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK);
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
