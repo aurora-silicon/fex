@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Core/Context.h>
@@ -43,6 +44,15 @@ static bool ProtIsReadable(ULONG Prot) {
 
 static bool ProtIsWritable(ULONG Prot) {
   return (Prot & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+// Themida keeps data that its protected code writes, and passes to system calls, on the same writable pages as that
+// code. System calls fail rather than fault when they write to a trapped page, so code on these pages is validated
+// inline instead.
+static bool IsInlineSMCCheckSection(const IMAGE_SECTION_HEADER& Section) {
+  const std::string_view Name(reinterpret_cast<const char*>(Section.Name),
+                              strnlen(reinterpret_cast<const char*>(Section.Name), IMAGE_SIZEOF_SHORT_NAME));
+  return Name == ".themida";
 }
 
 void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
@@ -152,6 +162,12 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
       if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
         LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", SectionBase, SectionBase + Section->Misc.VirtualSize);
         RWXIntervals.Insert({SectionBase, SectionBase + Section->Misc.VirtualSize});
+        if (IsInlineSMCCheckSection(*Section)) {
+          const auto InlineBase = SectionBase & FEXCore::Utils::FEX_PAGE_MASK;
+          const auto InlineEnd = FEXCore::AlignUp(SectionEnd, FEXCore::Utils::FEX_PAGE_SIZE);
+          LogMan::Msg::DFmt("Add inline SMC check interval: {:X} - {:X}", InlineBase, InlineEnd);
+          InlineSMCIntervals.Insert({InlineBase, InlineEnd});
+        }
       }
     }
   }
@@ -193,6 +209,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    InlineSMCIntervals.Remove({SectionBase, SectionBase + SectionSize});
   }
 
   return {SectionBase, SectionSize};
@@ -213,6 +230,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    InlineSMCIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }
 }
 
@@ -260,11 +278,30 @@ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint
   }
   const auto RWXResult = RWXIntervals.Query(Address);
   if (RWXResult.Enclosed) {
-    return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
+    return ClipToInlineSMCIntervals(Address, {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true});
   } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
-    return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
+    return ClipToInlineSMCIntervals(Address, {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false});
   }
-  return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
+  return ClipToInlineSMCIntervals(Address, {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false});
+}
+
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::ClipToInlineSMCIntervals(uint64_t Address, FEXCore::HLE::ExecutableRangeInfo Range) const {
+  const auto End = Range.Base + Range.Size;
+  if (SMCDetectionDisabled || !InlineSMCIntervals.Intersect({Range.Base, End})) {
+    return Range;
+  }
+
+  // The decoder applies the result to the whole range, so it must either need inline checks throughout or nowhere.
+  const auto InlineResult = InlineSMCIntervals.Query(Address);
+  if (InlineResult.Enclosed && Range.Writable) {
+    const auto ClippedBase = std::max(Range.Base, InlineResult.Interval.Offset);
+    const auto ClippedEnd = std::min(End, InlineResult.Interval.End);
+    return {ClippedBase, ClippedEnd - ClippedBase, true, true};
+  }
+
+  // A non-writable range may begin below writable pages that precede Address, so start at Address.
+  const auto ClippedEnd = (!InlineResult.Enclosed && InlineResult.Size) ? std::min(End, Address + InlineResult.Size) : End;
+  return {Address, ClippedEnd - Address, Range.Writable};
 }
 
 void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc) {
@@ -364,10 +401,20 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
         }
         HitRWXInterval = true;
       }
-      void* TmpAddress = reinterpret_cast<void*>(Address);
-      SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
-      ULONG TmpProt;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
+      const auto IntervalEnd = std::min(End, Address + Query.Size);
+      for (auto ProtAddress = Address; ProtAddress < IntervalEnd;) {
+        // Pages that rely on inline code checks are never trapped
+        const auto InlineQuery = ForWriteLocked ? decltype(InlineSMCIntervals)::QueryResult {} : InlineSMCIntervals.Query(ProtAddress);
+        const auto ProtEnd = InlineQuery.Size ? std::min(IntervalEnd, ProtAddress + InlineQuery.Size) : IntervalEnd;
+        if (!InlineQuery.Enclosed) {
+          void* TmpAddress = reinterpret_cast<void*>(ProtAddress);
+          SIZE_T TmpSize = static_cast<SIZE_T>(ProtEnd - ProtAddress);
+          ULONG TmpProt;
+          NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize,
+                                 ForWriteLocked ? GetUntrapProt(ProtAddress) : GetTrapProt(ProtAddress), &TmpProt);
+        }
+        ProtAddress = ProtEnd;
+      }
     } else if (!Query.Size) {
       // No more regions past `Address` in the interval list
       break;
