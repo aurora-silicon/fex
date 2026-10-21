@@ -396,8 +396,33 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
 }
 
 void OpDispatchBuilder::POPOp(OpcodeArgs) {
-  Ref Value = Pop(OpSizeFromSrc(Op));
-  StoreResultGPR(Op, Value);
+  const auto Size = OpSizeFromSrc(Op);
+  if (Op->Dest.IsGPR()) {
+    Ref Value = Pop(Size);
+    StoreResultGPR(Op, Value);
+    return;
+  }
+
+  // A memory destination is addressed with the incremented stack pointer when
+  // RSP is its base, but a store that faults leaves RSP unchanged: the
+  // instruction restarts. Load and store without updating RSP in place, and
+  // write the new stack pointer only after the store, so the fault context
+  // still holds the old one.
+  const auto GPRSize = GetGPROpSize();
+  Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
+  Ref Value = _LoadMemGPRAutoTSO(Size, OldSP, Size);
+
+  const auto& Dest = Op->Dest;
+  AddressMode A = DecodeAddress(Op, Dest, MemoryAccessType::DEFAULT, false /* IsLoad */);
+  const bool RSPBase =
+    ((Dest.IsGPRIndirect() || Dest.IsGPRIndirectRelocation()) && Dest.Data.GPRIndirect.GPR == X86State::REG_RSP) ||
+    ((Dest.IsSIB() || Dest.IsSIBRelocation()) && Dest.Data.SIB.Base == X86State::REG_RSP);
+  if (RSPBase) {
+    A.Base = Add(GPRSize, A.Base, IR::OpSizeToSize(Size));
+  }
+  _StoreMemAutoTSO(RegClass::GPR, Size, A, Value, Size);
+
+  StoreGPRRegister(X86State::REG_RSP, Add(GPRSize, OldSP, IR::OpSizeToSize(Size)));
 }
 
 void OpDispatchBuilder::POPAOp(OpcodeArgs) {
