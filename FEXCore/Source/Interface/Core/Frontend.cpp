@@ -99,6 +99,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     ExecutableRangeBase = RangeInfo.Base;
     ExecutableRangeEnd = RangeInfo.Base + RangeInfo.Size;
     ExecutableRangeWritable = RangeInfo.Writable;
+    ExecutableRangeNeedsInlineSMCChecks = RangeInfo.NeedsInlineSMCChecks;
 
     if (RangeInfo.Size == 0) {
       return false;
@@ -106,11 +107,13 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
 
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
     if (Size > RangeRemainingSize) {
+      HitInlineSMCCheckRange |= ExecutableRangeNeedsInlineSMCChecks;
       Size -= RangeRemainingSize;
       Address += RangeRemainingSize;
     }
   }
 
+  HitInlineSMCCheckRange |= ExecutableRangeNeedsInlineSMCChecks;
   return true;
 }
 
@@ -1077,6 +1080,7 @@ void Decoder::DecodeREXIfValid(int8_t ExpectedOffset) {
 Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
   // Will be set if DecodeInstructionImpl tries to read non-executable memory
   HitNonExecutableRange = false;
+  HitInlineSMCCheckRange = false;
   HitBadRelocation = false;
   auto ErrorDuringDecoding = DecodeInstructionImpl(PC);
 
@@ -1630,6 +1634,10 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
       ++BlockIt->NumInstructions;
       BlockIt->Size += DecodeInst->InstSize;
 
+      if (HitInlineSMCCheckRange) {
+        BlockIt->ForceFullSMCDetection = true;
+      }
+
       // if we weren't provided relocations (guest JIT), try to detect what we can
       if (WantsDataMasks && BlockIt->BlockStatus == DecodedBlockStatus::SUCCESS && BlockInfo.Is64BitMode && !Relocations) {
         DetectDataMasks(OpAddress, *BlockIt);
@@ -1754,6 +1762,9 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
   MaxCondBranchForward = 0;
   MaxCondBranchBackwards = ~0ULL;
   DecodedBuffer = PoolObject.ReownOrClaimBuffer();
+  // Protections may have changed since the last decode, and whether code needs inline SMC checks depends on them
+  ExecutableRangeBase = 0;
+  ExecutableRangeEnd = 0;
 
   // Decode operating mode from thread's CS segment.
   const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);

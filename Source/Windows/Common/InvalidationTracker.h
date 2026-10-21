@@ -58,8 +58,14 @@ private:
   ULONG GetTrapProt(uint64_t Address) const;
   ULONG GetUntrapProt(uint64_t Address) const;
 
+  // Narrows Range around Address so that it either lies within an inline SMC check interval or doesn't overlap one.
+  // NOTE: Must be called with IntervalsLock held.
+  FEXCore::HLE::ExecutableRangeInfo ClipToInlineSMCIntervals(uint64_t Address, FEXCore::HLE::ExecutableRangeInfo Range) const;
+
   FEXCore::IntervalList<uint64_t> XIntervals;
   FEXCore::IntervalList<uint64_t> RWXIntervals;
+  // Writable code ranges that are never trapped, code from them is validated inline instead.
+  FEXCore::IntervalList<uint64_t> InlineSMCIntervals;
   std::shared_mutex IntervalsLock;
   FEXCore::Context::Context& CTX;
   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;

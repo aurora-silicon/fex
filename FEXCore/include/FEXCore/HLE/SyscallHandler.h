@@ -21,6 +21,8 @@ struct ExecutableRangeInfo {
   uint64_t Base;
   uint64_t Size;
   bool Writable;
+  // Writes to the range are not trapped, so code decoded from it must validate itself before running.
+  bool NeedsInlineSMCChecks {};
 };
 
 class SyscallHandler;
