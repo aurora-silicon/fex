@@ -338,13 +338,17 @@ namespace CPU {
     return nullptr;
   }
 
-  bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
-    const auto CheckCodeBuffer = [](const CodeBuffer& Buffer, uintptr_t Address) {
-      const auto BufferPtr = reinterpret_cast<uintptr_t>(Buffer.GetBufferBase());
-      const uintptr_t LastPageAddr = BufferPtr + Buffer.UsableSize();
-      return (Address >= BufferPtr && Address < LastPageAddr);
-    };
+  static bool CheckCodeBuffer(const CodeBuffer& Buffer, uintptr_t Address) {
+    const auto BufferPtr = reinterpret_cast<uintptr_t>(Buffer.GetBufferBase());
+    const uintptr_t LastPageAddr = BufferPtr + Buffer.UsableSize();
+    return (Address >= BufferPtr && Address < LastPageAddr);
+  }
 
+  bool CPUBackend::IsAddressInCurrentCodeBuffer(uintptr_t Address) const {
+    return CheckCodeBuffer(*CurrentCodeBuffer, Address);
+  }
+
+  bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
     if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {
       return true;
     }

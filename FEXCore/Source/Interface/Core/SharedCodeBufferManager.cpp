@@ -81,7 +81,14 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
 
   auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
 
+  // Replacing an existing generation: ask for the older generations to be retired at the next safe point.
+  const bool Replacing = !!Latest;
+
   Latest = Buffer;
+
+  if (Replacing) {
+    RetirePending.store(true, std::memory_order_release);
+  }
 
   OnCodeBufferAllocated(Buffer);
 

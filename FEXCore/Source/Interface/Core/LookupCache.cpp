@@ -108,4 +108,21 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   BlockList.clear();
 }
 
+void GuestToHostMap::Retire(const LookupCacheWriteLockToken&) {
+  // Sever every recorded link so that each block exit of this generation returns to the dispatcher.
+  // This is the same patching that ::Erase performs on SMC invalidation, applied to all links at once.
+  for (auto& [Tag, Delinker] : *BlockLinks) {
+    Delinker(Tag.HostLink);
+  }
+
+  // The map and all of its nodes live in the monotonic arena. Nothing references them anymore,
+  // so the arena can be handed back to the OS right away instead of waiting for the final owner.
+  BlockLinks_mbr.release();
+  BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+
+  // No block of this generation may be found through L3 anymore.
+  BlockList.clear();
+  CodePages.clear();
+}
+
 } // namespace FEXCore

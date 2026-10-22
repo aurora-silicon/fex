@@ -133,6 +133,10 @@ namespace CPU {
 
     bool IsAddressInCodeBuffer(uintptr_t Address) const;
 
+    // Like IsAddressInCodeBuffer but only checks the generation that new code is being written to.
+    // Block links must only be recorded for callsites inside this generation.
+    bool IsAddressInCurrentCodeBuffer(uintptr_t Address) const;
+
     // Updates the CodeBuffer if needed and returns a reference to the old one.
     // The returned reference should be kept alive carefully to avoid early deletion of resources.
     [[nodiscard]]

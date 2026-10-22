@@ -429,6 +429,12 @@ public:
   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 
+  // Drops lookup data and block links of every CodeBuffer generation older than the latest one and
+  // clears the thread-local caches of all threads still executing from those generations, so that they
+  // return to the dispatcher at their next block exit and migrate to the latest generation.
+  // Must be called without the CodeInvalidationMutex held; takes it exclusively.
+  void RetireOldCodeBuffers(FEXCore::Core::InternalThreadState* Thread);
+
   FEXCore::JITSymbols Symbols;
 
   FEXCore::Utils::PooledAllocatorVirtual OpDispatcherAllocator {"FEXMem_OpDispatcher"};
@@ -517,5 +523,12 @@ private:
 
   std::mutex CodeBufferListLock;
   fextl::vector<std::weak_ptr<CPU::CodeBuffer>> CodeBufferList;
+
+  // Every live thread of this context. Maintained by CreateThread/DestroyThread; only used to kick threads
+  // out of retired CodeBuffer generations. Locked after CodeInvalidationMutex, never before it.
+  FEXCore::ForkableUniqueMutex ThreadListLock;
+  fextl::vector<FEXCore::Core::InternalThreadState*> ThreadList;
+
+  uintptr_t CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst);
 };
 } // namespace FEXCore::Context

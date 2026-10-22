@@ -34,6 +34,10 @@ $end_info$
 #include <FEXCore/Utils/SpinWaitLock.h>
 #include "Utils/variable_length_integer.h"
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
@@ -436,6 +440,11 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
 
   Thread->CurrentFrame->State.DeferredSignalRefCount.Store(0);
 
+  {
+    std::lock_guard lk(ThreadListLock);
+    ThreadList.emplace_back(Thread);
+  }
+
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
     // Allocate a JIT symbol buffer only if enabled.
     Thread->SymbolBuffer = JITSymbols::AllocateBuffer();
@@ -445,6 +454,13 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
 }
 
 void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
+  {
+    std::lock_guard lk(ThreadListLock);
+    auto It = std::find(ThreadList.begin(), ThreadList.end(), Thread);
+    if (It != ThreadList.end()) {
+      ThreadList.erase(It);
+    }
+  }
   FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
                                      Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
   delete Thread;
@@ -464,7 +480,12 @@ void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread
     if (Config.StrictInProcessSplitLocks) {
       StrictSplitLockMutex = 0;
     }
+    // Only the forking thread survives in the child.
+    ThreadListLock.StealAndDropActiveLocks();
+    ThreadList.clear();
+    ThreadList.emplace_back(LiveThread);
   } else {
+    ThreadListLock.unlock();
     CodeInvalidationMutex.unlock();
     if (Config.StrictInProcessSplitLocks) {
       FEXCore::Utils::SpinWaitLock::unlock(&StrictSplitLockMutex);
@@ -474,6 +495,7 @@ void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread
 
 void ContextImpl::LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {
   CodeInvalidationMutex.lock();
+  ThreadListLock.lock();
   Allocator::LockBeforeFork(Thread);
   if (Config.StrictInProcessSplitLocks) {
     FEXCore::Utils::SpinWaitLock::lock(&StrictSplitLockMutex);
@@ -849,6 +871,19 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 }
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+  const auto HostCode = CompileBlockLocked(Frame, GuestRIP, MaxInst);
+
+  // Safe point: no locks are held here. If a compile (in this or any other thread) started a new CodeBuffer
+  // generation, retire the older ones now so that their memory can be released as soon as every thread has
+  // left them. Only one thread needs to do this per generation switch.
+  if (RetirePending.load(std::memory_order_acquire) && RetirePending.exchange(false, std::memory_order_acq_rel)) {
+    RetireOldCodeBuffers(Frame->Thread);
+  }
+
+  return HostCode;
+}
+
+uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
     // Force MaxInst to only be one in this case.
@@ -1043,6 +1078,76 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   Thread->CPUBackend->ClearRelocations();
 
   return (uintptr_t)CodePtr;
+}
+
+void ContextImpl::RetireOldCodeBuffers(FEXCore::Core::InternalThreadState* Thread) {
+  FEXCORE_PROFILE_SCOPED("RetireOldCodeBuffers");
+
+  // Exclusive section: no thread is compiling, linking blocks or invalidating code while this runs.
+  // Threads executing JIT code are not stopped; everything below only ever makes them fall back to the
+  // dispatcher (the same guarantees cross-thread SMC invalidation relies on).
+  auto lk = GuardSignalDeferringSection(CodeInvalidationMutex, Thread);
+
+  // Collect every live generation other than the latest one. Strong references keep them alive for the
+  // duration of this function only; the memory itself is released once the last thread leaves a generation.
+  fextl::vector<fextl::shared_ptr<CPU::CodeBuffer>> Retired;
+  {
+    std::scoped_lock lk2 {CodeBufferListLock};
+    const auto* Latest = GetLatestIfAllocated();
+    auto it = CodeBufferList.begin();
+    while (it != CodeBufferList.end()) {
+      auto Strong = it->lock();
+      if (!Strong) {
+        it = CodeBufferList.erase(it);
+        continue;
+      }
+      if (Strong.get() != Latest && !Strong->Retired) {
+        Strong->Retired = true;
+        Retired.emplace_back(std::move(Strong));
+      }
+      ++it;
+    }
+  }
+
+  if (Retired.empty()) {
+    return;
+  }
+
+  // 1. Delink every block of the retired generations and drop their L3 lookup data. From now on, no block of
+  //    a retired generation can reach another block without a cache lookup, and no lookup can find one.
+  for (auto& Buffer : Retired) {
+    auto WriteLock = Buffer->LookupCache->AcquireWriteLock();
+    Buffer->LookupCache->Retire(WriteLock);
+  }
+
+  // 2. Clear the L1/L2 caches and call-ret stacks of every thread still executing from a retired generation.
+  //    Their next block exit misses everything, enters CompileBlock, and CheckCodeBufferUpdate migrates them.
+  //    A thread's Shared map only changes inside the compile path (excluded by the exclusive lock above).
+  {
+    std::lock_guard lk3(ThreadListLock);
+    for (auto* T : ThreadList) {
+      const auto* Shared = T->LookupCache->Shared;
+      const bool InRetired = std::any_of(Retired.begin(), Retired.end(),
+                                         [Shared](const auto& Buffer) { return Buffer->LookupCache.get() == Shared; });
+      if (!InRetired) {
+        continue;
+      }
+      T->LookupCache->InvalidateAllCachedCode();
+      if (T->CallRetStackBase) {
+        // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
+        Allocator::VirtualDontNeed(T->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+      }
+    }
+  }
+
+#if !defined(_WIN32) && defined(MADV_COLD)
+  // 3. Nothing can look these generations up anymore. Any thread still inside one leaves at its next block exit
+  //    (or when it returns from a blocking syscall / signal handler). Tell the kernel to reclaim these pages first
+  //    under memory pressure. This is a hint only: no I/O happens unless the system is short on memory.
+  for (auto& Buffer : Retired) {
+    ::madvise(Buffer->GetBufferBase(), Buffer->TotalAllocationSize(), MADV_COLD);
+  }
+#endif
 }
 
 void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {

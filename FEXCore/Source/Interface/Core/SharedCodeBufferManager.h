@@ -12,6 +12,7 @@ $end_info$
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -22,6 +23,10 @@ struct GuestToHostMap;
 namespace FEXCore::CPU {
 struct CodeBuffer {
   fextl::unique_ptr<GuestToHostMap> LookupCache;
+
+  // Set once this generation has been superseded by a newer one and its lookup data was dropped
+  // (see ContextImpl::RetireOldCodeBuffers). The memory stays valid while any thread still references it.
+  bool Retired {false};
 
   CodeBuffer(size_t Size, bool ShouldBeNamed);
   CodeBuffer(const CodeBuffer&) = delete;
@@ -127,6 +132,15 @@ public:
   fextl::shared_ptr<CodeBuffer> StartMaximalCodeBuffer();
 
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+
+  // Set whenever a new generation replaces an existing one. Consumed by ContextImpl::RetireOldCodeBuffers,
+  // which runs outside of the compile path's shared CodeInvalidationMutex section.
+  std::atomic<bool> RetirePending {false};
+
+  // Returns the latest CodeBuffer without allocating one. May be nullptr before the first allocation.
+  CodeBuffer* GetLatestIfAllocated() const {
+    return Latest.get();
+  }
 
 private:
   fextl::shared_ptr<CodeBuffer> Latest;

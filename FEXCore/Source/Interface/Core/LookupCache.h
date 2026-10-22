@@ -157,6 +157,11 @@ struct GuestToHostMap {
   }
 
   void ClearCache(const LookupCacheWriteLockToken&);
+
+  // Drops every block mapping, code-page record and block link of this (superseded) generation.
+  // Every recorded link is severed first so that no block of this generation can reach another one
+  // without going through the dispatcher. Requires the CodeInvalidationMutex to be held exclusively.
+  void Retire(const LookupCacheWriteLockToken&);
 };
 
 class LookupCache {
@@ -358,6 +363,20 @@ public:
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
                     const FEXCore::Context::BlockDelinkerFunc& delinker, const LookupCacheWriteLockToken& lk) {
     Shared->AddBlockLink(GuestDestination, HostLink, delinker, lk);
+  }
+
+  // Invalidates every L1/L2 entry this thread has ever fetched, entry by entry.
+  // Safe to call from another thread (cross-thread invalidation rules of ::InvalidateCache apply):
+  // the owning thread may be executing JIT code concurrently and only ever observes a cleared guest
+  // address, never a dangling host pointer. Requires the CodeInvalidationMutex to be held exclusively.
+  void InvalidateAllCachedCode() {
+    auto lk = Shared->AcquireWriteLock();
+    for (auto& [Page, Entries] : CachedCodePages) {
+      for (const auto& Entry : Entries) {
+        InvalidateCache(Entry, lk);
+      }
+    }
+    CachedCodePages.clear();
   }
 
   void ClearCache(const LookupCacheWriteLockToken&);
