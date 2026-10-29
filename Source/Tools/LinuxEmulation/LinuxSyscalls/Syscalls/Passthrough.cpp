@@ -10,8 +10,13 @@ $end_info$
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
 
+#include <algorithm>
+#include <array>
+#include <errno.h>
+#include <linux/io_uring.h>
 #include <stdint.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 
 namespace FEX::HLE {
 #ifdef ARCHITECTURE_arm64
@@ -209,6 +214,73 @@ uint64_t SyscallPassthrough7(FEXCore::Core::CpuStateFrame* Frame, uint64_t arg1,
 }
 #endif
 
+#ifdef ARCHITECTURE_arm64
+// io_uring for x86-64 guests. The queues are guest memory the kernel reads directly, so FEX can't rewrite
+// requests. Every opcode's arguments have the same layout on x86-64 and arm64 except the epoll ones (x86's epoll_event
+// is a 12-byte packed struct, 16 bytes elsewhere) and URING_CMD (driver-defined payloads FEX can't know). So each ring
+// is created disabled, restricted to every other opcode, then enabled: a forbidden request completes with -EACCES
+// instead of corrupting data. A guest that registers its own restrictions gets -EBUSY (one restriction set per ring).
+static uint64_t IOUringSetupRestricted(FEXCore::Core::CpuStateFrame* Frame, uint32_t entries, io_uring_params* guest_params) {
+  io_uring_params params;
+  if (FaultSafeUserMemAccess::CopyFromUser(&params, guest_params, sizeof(params)) == EFAULT) {
+    return -EFAULT;
+  }
+  const uint32_t guest_flags = params.flags;
+  if (guest_flags & IORING_SETUP_REGISTERED_FD_ONLY) {
+    // No file descriptor comes back to restrict the ring through.
+    return -EINVAL;
+  }
+  params.flags |= IORING_SETUP_R_DISABLED;
+  const int fd = ::syscall(SYSCALL_DEF(io_uring_setup), entries, &params);
+  if (fd < 0) {
+    return -errno;
+  }
+
+  // The running kernel may know fewer opcodes than these headers: ask it, it refuses restrictions past its last.
+  uint32_t sqe_ops = IORING_OP_LAST;
+  alignas(io_uring_probe) std::array<uint8_t, sizeof(io_uring_probe) + 256 * sizeof(io_uring_probe_op)> probe {};
+  if (::syscall(SYSCALL_DEF(io_uring_register), fd, IORING_REGISTER_PROBE, probe.data(), 256) == 0) {
+    sqe_ops = std::min<uint32_t>(sqe_ops, reinterpret_cast<io_uring_probe*>(probe.data())->last_op + 1);
+  }
+
+  int result = -1;
+  for (uint32_t register_ops = IORING_REGISTER_LAST; register_ops > 0 && result != 0; --register_ops) {
+    std::array<io_uring_restriction, 2 * 256 + 1> res {};
+    uint32_t n = 0;
+    for (uint32_t op = 0; op < register_ops; ++op) {
+      res[n].opcode = IORING_RESTRICTION_REGISTER_OP;
+      res[n++].register_op = op;
+    }
+    for (uint32_t op = 0; op < sqe_ops; ++op) {
+      if (op == IORING_OP_EPOLL_CTL || op == IORING_OP_EPOLL_WAIT || op == IORING_OP_URING_CMD || op == IORING_OP_URING_CMD128) {
+        continue;
+      }
+      res[n].opcode = IORING_RESTRICTION_SQE_OP;
+      res[n++].sqe_op = op;
+    }
+    res[n].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
+    res[n++].sqe_flags = 0xff;
+    result = ::syscall(SYSCALL_DEF(io_uring_register), fd, IORING_REGISTER_RESTRICTIONS, res.data(), n);
+    if (result != 0 && errno != EINVAL) {
+      break;
+    }
+  }
+  if (result != 0 || (!(guest_flags & IORING_SETUP_R_DISABLED) &&
+                      ::syscall(SYSCALL_DEF(io_uring_register), fd, IORING_REGISTER_ENABLE_RINGS, nullptr, 0) != 0)) {
+    const int err = errno;
+    close(fd);
+    return -err;
+  }
+
+  params.flags = guest_flags;
+  if (FaultSafeUserMemAccess::CopyToUser(guest_params, &params, sizeof(params)) == EFAULT) {
+    close(fd);
+    return -EFAULT;
+  }
+  return fd;
+}
+#endif
+
 static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
   REGISTER_SYSCALL_IMPL(write, SyscallPassthrough3<SYSCALL_DEF(write)>);
@@ -352,14 +424,6 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(pkey_mprotect, SyscallPassthrough4<SYSCALL_DEF(pkey_mprotect)>);
   REGISTER_SYSCALL_IMPL(pkey_alloc, SyscallPassthrough2<SYSCALL_DEF(pkey_alloc)>);
   REGISTER_SYSCALL_IMPL(pkey_free, SyscallPassthrough1<SYSCALL_DEF(pkey_free)>);
-  // io_uring can't be emulated as it can pass `epoll_event` objects around.
-  // These are 12-byte packed structs on x86/x86-64, but on other architectures are 16-byte.
-  // This means the `data` member is at offset 4 on x86, but offset 8 on other architectures, corrupting the data.
-  // The queue data is entirely user-controlled, so we can't rewrite data in any sane fashion.
-  // This is visible with `node.js` as a hang.
-  REGISTER_SYSCALL_IMPL(io_uring_setup, UnimplementedSyscallSafe);
-  REGISTER_SYSCALL_IMPL(io_uring_enter, UnimplementedSyscallSafe);
-  REGISTER_SYSCALL_IMPL(io_uring_register, UnimplementedSyscallSafe);
   REGISTER_SYSCALL_IMPL(open_tree, SyscallPassthrough3<SYSCALL_DEF(open_tree)>);
   REGISTER_SYSCALL_IMPL(move_mount, SyscallPassthrough5<SYSCALL_DEF(move_mount)>);
   REGISTER_SYSCALL_IMPL(fsopen, SyscallPassthrough3<SYSCALL_DEF(fsopen)>);
@@ -415,6 +479,9 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
 namespace x64 {
   void RegisterPassthrough(FEX::HLE::SyscallHandler* Handler) {
     RegisterCommon(Handler);
+    REGISTER_SYSCALL_IMPL_X64(io_uring_setup, IOUringSetupRestricted);
+    REGISTER_SYSCALL_IMPL_X64(io_uring_enter, SyscallPassthrough6<SYSCALL_DEF(io_uring_enter)>);
+    REGISTER_SYSCALL_IMPL_X64(io_uring_register, SyscallPassthrough4<SYSCALL_DEF(io_uring_register)>);
     REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
     REGISTER_SYSCALL_IMPL_X64(ioctl, SyscallPassthrough3<SYSCALL_DEF(ioctl)>);
     REGISTER_SYSCALL_IMPL_X64(pread_64, SyscallPassthrough4<SYSCALL_DEF(pread_64)>);
@@ -502,6 +569,10 @@ namespace x64 {
 namespace x32 {
   void RegisterPassthrough(FEX::HLE::SyscallHandler* Handler) {
     RegisterCommon(Handler);
+    // 32-bit guests: iovec, msghdr and pointer-sized fields in the requests differ from arm64's.
+    REGISTER_SYSCALL_IMPL_X32(io_uring_setup, UnimplementedSyscallSafe);
+    REGISTER_SYSCALL_IMPL_X32(io_uring_enter, UnimplementedSyscallSafe);
+    REGISTER_SYSCALL_IMPL_X32(io_uring_register, UnimplementedSyscallSafe);
     REGISTER_SYSCALL_IMPL_X32(getuid32, SyscallPassthrough0<SYSCALL_DEF(getuid)>);
     REGISTER_SYSCALL_IMPL_X32(getgid32, SyscallPassthrough0<SYSCALL_DEF(getgid)>);
     REGISTER_SYSCALL_IMPL_X32(geteuid32, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
