@@ -27,6 +27,11 @@ constexpr std::array<uint32_t, 17> FlagOffsets = {
 };
 
 void OpDispatchBuilder::ZeroPF_AF() {
+  if (APFLG()) {
+    SetAPFLGBits(Constant(0), Constant(0));
+    return;
+  }
+
   // PF is stored inverted, so invert it when we zero.
   SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(Constant(1));
   SetAF(0);
@@ -47,6 +52,11 @@ void OpDispatchBuilder::SetPackedRFLAG(bool Lower8, Ref Src) {
   for (size_t i = 0; i < NumFlags; ++i) {
     const auto FlagOffset = FlagOffsets[i];
 
+    if (APFLG() && (FlagOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC || FlagOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC)) {
+      // Inserted into NZCV after the loop.
+      continue;
+    }
+
     if (FlagOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC) {
       // AF is in bit 4 architecturally, and we need to store it to bit 4 of our
       // AF register, with garbage in the other bits. The extract is deferred.
@@ -63,6 +73,11 @@ void OpDispatchBuilder::SetPackedRFLAG(bool Lower8, Ref Src) {
     } else {
       SetRFLAG(Src, FlagOffset, FlagOffset, true);
     }
+  }
+
+  if (APFLG()) {
+    SetAPFLGBits(_Bfe(OpSize::i32Bit, 1, FEXCore::X86State::RFLAG_PF_RAW_LOC, Src),
+                 _Bfe(OpSize::i32Bit, 1, FEXCore::X86State::RFLAG_AF_RAW_LOC, Src));
   }
 
   CFInverted = true;
@@ -87,7 +102,7 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
     }
 
     if ((GetNZ && (FlagOffset == FEXCore::X86State::RFLAG_SF_RAW_LOC || FlagOffset == FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ||
-        FlagOffset == FEXCore::X86State::RFLAG_CF_RAW_LOC || FlagOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+        FlagOffset == FEXCore::X86State::RFLAG_CF_RAW_LOC || (FlagOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC && !APFLG())) {
       // Already handled
       continue;
     }
@@ -97,6 +112,8 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
     Ref Flag;
     if (FlagOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC) {
       Flag = LoadAF();
+    } else if (APFLG() && FlagOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+      Flag = GetAPFLGBit(APFLG_PF_BIT);
     } else {
       Flag = GetRFLAG(FlagOffset);
     }
@@ -107,7 +124,7 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
   // Raw PF value needs to have its bottom bit masked out and inverted. The
   // naive sequence is and/eor/orlshl. But we can do the inversion implicitly
   // instead.
-  if (FlagsMask & (1 << FEXCore::X86State::RFLAG_PF_RAW_LOC)) {
+  if ((FlagsMask & (1 << FEXCore::X86State::RFLAG_PF_RAW_LOC)) && !APFLG()) {
     // Set every bit except the bottommost.
     auto OnesInvPF = _Or(OpSize::i64Bit, LoadPFRaw(false, false), _InlineConstant(~1ull));
 
@@ -175,11 +192,24 @@ Ref OpDispatchBuilder::LoadPFRaw(bool Mask, bool Invert) {
   // Most blocks do not read parity, so PF optimization is gated on this flag.
   CurrentHeader->ReadsParity = true;
 
+  if (APFLG()) {
+    // Bottom bit is PF if Invert, else !PF, as for the raw parity below.
+    if (!Invert && LazyPFInv) {
+      return LazyPFInv;
+    }
+    Ref PF = GetAPFLGBit(APFLG_PF_BIT);
+    return Invert ? PF : _Xor(OpSize::i32Bit, PF, Constant(1));
+  }
+
   // Evaluate parity on the deferred raw value.
   return _Parity(GetRFLAG(FEXCore::X86State::RFLAG_PF_RAW_LOC), Mask, Invert);
 }
 
 Ref OpDispatchBuilder::LoadAF() {
+  if (APFLG()) {
+    return GetAPFLGBit(APFLG_AF_BIT);
+  }
+
   // Read the stored value. This is the XOR of the arguments.
   auto AFWord = GetRFLAG(FEXCore::X86State::RFLAG_AF_RAW_LOC);
 
@@ -192,6 +222,8 @@ Ref OpDispatchBuilder::LoadAF() {
 }
 
 void OpDispatchBuilder::FixupAF() {
+  LOGMAN_THROW_A_FMT(!APFLG(), "FixupAF with APFLG");
+
   // The caller has set a desired value of AF in AF[4], regardless of the value
   // of PF. We need to fixup AF[4] so that we get the right value when we XOR in
   // PF[4] later. The easiest solution is to XOR by PF[4], since:
@@ -207,6 +239,11 @@ void OpDispatchBuilder::FixupAF() {
 }
 
 void OpDispatchBuilder::SetAFAndFixup(Ref AF) {
+  if (APFLG()) {
+    SetAPFLGBits(nullptr, AF);
+    return;
+  }
+
   // We have a value of AF, we shift into AF[4].  We need to fixup AF[4] so that
   // we get the right value when we XOR in PF[4] later. The easiest solution is
   // to XOR by PF[4], since:
@@ -220,11 +257,41 @@ void OpDispatchBuilder::SetAFAndFixup(Ref AF) {
 }
 
 void OpDispatchBuilder::CalculatePF(Ref Res) {
+  if (APFLG()) {
+    // Not computed by the host: insert PF, and AF if it is pending.
+    Ref AF = nullptr;
+    if (PendingAF.Src1) {
+      Ref X = PendingAF.Src1 == PendingAF.Src2 ? Res : _Xor(OpSize::i64Bit, _Xor(OpSize::i64Bit, PendingAF.Src1, PendingAF.Src2), Res);
+      AF = _Bfe(OpSize::i32Bit, 1, 4, X);
+      PendingAF = {};
+    }
+
+    SetAPFLGBits(_Parity(Res, true, true), AF);
+    return;
+  }
+
   // Calculation is entirely deferred until load, just store the 8-bit result.
   SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(Res);
 }
 
+void OpDispatchBuilder::CalculatePFAFFromHost(Ref Res) {
+  if (APFLG()) {
+    // The flag operation left x86 PF and AF in NZCV.
+    PendingAF = {};
+    DropLazyPFAF();
+    return;
+  }
+
+  CalculatePF(Res);
+}
+
 void OpDispatchBuilder::CalculateAF(Ref Src1, Ref Src2) {
+  if (APFLG()) {
+    // AF needs the result; CalculatePF (or the host) supplies it.
+    PendingAF = {Src1, Src2};
+    return;
+  }
+
   // We only care about bit 4 in the subsequent XOR. If we'll XOR with 0,
   // there's no sense XOR'ing at all. If we'll XOR with 1, that's just
   // inverting.
@@ -251,13 +318,17 @@ void OpDispatchBuilder::CalculateAF(Ref Src1, Ref Src2) {
   SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(XorRes);
 }
 
-void OpDispatchBuilder::CalculateDeferredFlags() {
+void OpDispatchBuilder::CalculateDeferredFlags(bool KeepLazyPFAF) {
   if (NZCVDirty && CachedNZCV) {
     _StoreNZCV(CachedNZCV);
   }
 
   CachedNZCV = nullptr;
   NZCVDirty = false;
+
+  if (!KeepLazyPFAF) {
+    StoreLazyPFAF();
+  }
 }
 
 Ref OpDispatchBuilder::IncrementByCarry(OpSize OpSize, Ref Src) {
@@ -269,6 +340,7 @@ Ref OpDispatchBuilder::IncrementByCarry(OpSize OpSize, Ref Src) {
 Ref OpDispatchBuilder::CalculateFlags_ADC(IR::OpSize SrcSize, Ref Src1, Ref Src2) {
   auto OpSize = SrcSize == OpSize::i64Bit ? OpSize::i64Bit : OpSize::i32Bit;
   Ref Res;
+  bool PFAFFromHost = false;
 
   CalculateAF(Src1, Src2);
 
@@ -277,6 +349,7 @@ Ref OpDispatchBuilder::CalculateFlags_ADC(IR::OpSize SrcSize, Ref Src1, Ref Src2
     HandleNZCV_RMW();
     Res = _AdcWithFlags(OpSize, Src1, Src2);
     CFInverted = false;
+    PFAFFromHost = true;
   } else {
     // Need to zero-extend for correct comparisons below
     Src2 = ARef(Src2).Bfe(0, IR::OpSizeAsBits(SrcSize)).Ref();
@@ -297,7 +370,11 @@ Ref OpDispatchBuilder::CalculateFlags_ADC(IR::OpSize SrcSize, Ref Src1, Ref Src2
     CalculateOF(SrcSize, Res, Src1, Src2, false);
   }
 
-  CalculatePF(Res);
+  if (PFAFFromHost) {
+    CalculatePFAFFromHost(Res);
+  } else {
+    CalculatePF(Res);
+  }
   return Res;
 }
 
@@ -307,12 +384,14 @@ Ref OpDispatchBuilder::CalculateFlags_SBB(IR::OpSize SrcSize, Ref Src1, Ref Src2
   CalculateAF(Src1, Src2);
 
   Ref Res;
+  bool PFAFFromHost = false;
   if (SrcSize >= OpSize::i32Bit) {
     // Arm's subtraction has inverted CF from x86, so rectify the input and
     // invert the output.
     RectifyCarryInvert(true);
     HandleNZCV_RMW();
     Res = _SbbWithFlags(OpSize, Src1, Src2);
+    PFAFFromHost = true;
     CFInverted = true;
   } else {
     // Zero extend for correct comparison behaviour with Src1 = 0xffff.
@@ -331,7 +410,11 @@ Ref OpDispatchBuilder::CalculateFlags_SBB(IR::OpSize SrcSize, Ref Src1, Ref Src2
     CalculateOF(SrcSize, Res, Src1, Src2, true);
   }
 
-  CalculatePF(Res);
+  if (PFAFFromHost) {
+    CalculatePFAFFromHost(Res);
+  } else {
+    CalculatePF(Res);
+  }
   return Res;
 }
 
@@ -345,13 +428,25 @@ Ref OpDispatchBuilder::CalculateFlags_SUB(IR::OpSize SrcSize, Ref Src1, Ref Src2
 
   Ref Res;
   if (SrcSize >= OpSize::i32Bit) {
-    Res = SubWithFlags(SrcSize, Src1, Src2);
+    // SubWithFlags turns a negative constant into an add of its negation (C
+    // and V are unchanged by that), but the host then computes AF from the
+    // negated operand. Under APFLG keep the subtract so AF is x86's.
+    Res = APFLG() ? _SubWithFlags(SrcSize, Src1, Src2) : SubWithFlags(SrcSize, Src1, Src2);
+    CalculatePFAFFromHost(Res);
+  } else if (APFLG()) {
+    // 8/16-bit: a 32-bit compare of the operands shifted to the top gives the
+    // narrow NZCV. PF/AF come from a compare of the unshifted operands, which
+    // the dead-flag pass drops when they are not needed.
+    auto Shift = _InlineConstant(32 - IR::OpSizeAsBits(SrcSize));
+    _SubNZCV(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Src1, Shift), _Lshl(OpSize::i32Bit, Src2, Shift));
+    _APFLGFromCompare(Src1, Src2, false);
+    Res = Sub(OpSize::i32Bit, Src1, Src2);
+    CalculatePFAFFromHost(Res);
   } else {
     _SubNZCV(SrcSize, Src1, Src2);
     Res = Sub(OpSize::i32Bit, Src1, Src2);
+    CalculatePF(Res);
   }
-
-  CalculatePF(Res);
 
   // If we're updating CF, we need it to be inverted because SubNZCV is inverted
   // from x86. If we're not updating CF, we need to restore the CF since we
@@ -375,13 +470,21 @@ Ref OpDispatchBuilder::CalculateFlags_ADD(IR::OpSize SrcSize, Ref Src1, Ref Src2
 
   Ref Res;
   if (SrcSize >= OpSize::i32Bit) {
-    Res = AddWithFlags(SrcSize, Src1, Src2);
+    // As in CalculateFlags_SUB: the add-to-subtract rewrite changes AF.
+    Res = APFLG() ? _AddWithFlags(SrcSize, Src1, Src2) : AddWithFlags(SrcSize, Src1, Src2);
+    CalculatePFAFFromHost(Res);
+  } else if (APFLG()) {
+    // As in CalculateFlags_SUB.
+    auto Shift = _InlineConstant(32 - IR::OpSizeAsBits(SrcSize));
+    _AddNZCV(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Src1, Shift), _Lshl(OpSize::i32Bit, Src2, Shift));
+    _APFLGFromCompare(Src1, Src2, true);
+    Res = Add(OpSize::i32Bit, Src1, Src2);
+    CalculatePFAFFromHost(Res);
   } else {
     _AddNZCV(SrcSize, Src1, Src2);
     Res = Add(OpSize::i32Bit, Src1, Src2);
+    CalculatePF(Res);
   }
-
-  CalculatePF(Res);
 
   // We stomped over CF while calculation flags, restore it.
   if (UpdateCF) {
@@ -457,7 +560,7 @@ void OpDispatchBuilder::CalculateFlags_ShiftLeftImmediate(IR::OpSize SrcSize, Re
     }
   }
 
-  CalculatePF(UnmaskedRes);
+  CalculatePFAFFromHost(UnmaskedRes);
   InvalidateAF();
 
   // OF
@@ -481,7 +584,7 @@ void OpDispatchBuilder::CalculateFlags_SignShiftRightImmediate(IR::OpSize SrcSiz
   // Extract the last bit shifted in to CF
   SetCFDirect(Src1, Shift - 1, true);
 
-  CalculatePF(Res);
+  CalculatePFAFFromHost(Res);
   InvalidateAF();
 
   // OF
@@ -498,7 +601,7 @@ void OpDispatchBuilder::CalculateFlags_ShiftRightImmediateCommon(IR::OpSize SrcS
   // Extract the last bit shifted in to CF
   SetCFDirect(Src1, Shift - 1, true);
 
-  CalculatePF(Res);
+  CalculatePFAFFromHost(Res);
   InvalidateAF();
 }
 

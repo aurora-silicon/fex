@@ -1173,6 +1173,14 @@ void Decoder::BranchTargetInMultiblockRange() {
     TargetRIP = InstEnd + DecodeInst->Src[0].Literal();
     break;
   }
+  case 0xE0 ... 0xE3: // LOOPNE, LOOPE, LOOP, JrCXZ
+    // With APFLG, every unit exit writes PF/AF back into NZCV, so a loop split
+    // into units at its LOOP/JrCXZ pays that on each iteration.
+    if (!CTX->HostFeatures.SupportsAPFLG) {
+      return;
+    }
+    TargetRIP = InstEnd + DecodeInst->Src[0].Literal();
+    break;
   case 0xE9:
   case 0xEB: // Both are unconditional JMP instructions
     TargetRIP = InstEnd + DecodeInst->Src[0].Literal();

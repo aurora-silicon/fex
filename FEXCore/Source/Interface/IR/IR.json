@@ -516,9 +516,29 @@
         "DestSize": "OpSize::i32Bit"
       },
 
+      "APFLGFromCompare GPR:$Src1, GPR:$Src2, i1:$IsAdd": {
+        "HasSideEffects": true,
+        "Desc": ["Apple APFLG: sets NZCV bits 26/27 to the x86 PF/AF of a 32-bit compare (or cmn) of the",
+                 "sources and keeps NZCV bits 28-31"],
+        "DestSize": "OpSize::i32Bit"
+      },
+
+      "GPR = LoadNZCVOnly": {
+        "Desc": ["Loads NZCV as LoadNZCV does, for users of bits 28-31 only: with APFLG,",
+                 "bits 26/27 (PF/AF) do not count as read"],
+        "DestSize": "OpSize::i32Bit"
+      },
+
       "StoreNZCV GPR:$Value": {
         "HasSideEffects": true,
         "Desc": ["Stores value to NZCV register"],
+        "DestSize": "OpSize::i32Bit"
+      },
+
+      "StoreAPFLG GPR:$PF, GPR:$AF, u8:$Mask": {
+        "HasSideEffects": true,
+        "Desc": ["Apple APFLG: inserts 0/1 values into NZCV bit 26 (PF, Mask bit 0) and bit 27 (AF, Mask bit 1)",
+                 "and keeps the other bits. A source whose Mask bit is clear is ignored and may be Invalid."],
         "DestSize": "OpSize::i32Bit"
       },
 

@@ -74,7 +74,7 @@ void PassManager::AddDefaultPasses(Context::ContextImpl* ctx) {
   // still be well-formed regardless of the modifications made to it.
   if (!DisablePasses()) {
     InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
-    InsertPass(CreateDeadFlagCalculationEliminination());
+    InsertPass(CreateDeadFlagCalculationEliminination(ctx->HostFeatures.SupportsAPFLG));
   }
 
   InsertPass(IR::CreateRegisterAllocationPass(&ctx->CPUID), "RA");

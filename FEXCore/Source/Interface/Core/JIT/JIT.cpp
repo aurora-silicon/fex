@@ -665,6 +665,7 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
   , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
   , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0}
   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP != 0}
+  , HostSupportsAPFLG {ctx->HostFeatures.SupportsAPFLG != 0}
   , CTX {ctx}
   , TempCodeBufferAllocator(ctx->CPUBackendAllocator, 0) {
 

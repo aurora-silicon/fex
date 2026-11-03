@@ -11,7 +11,7 @@ struct HostFeatures;
 namespace FEXCore::IR {
 class Pass;
 
-fextl::unique_ptr<Pass> CreateDeadFlagCalculationEliminination();
+fextl::unique_ptr<Pass> CreateDeadFlagCalculationEliminination(bool APFLG);
 fextl::unique_ptr<Pass> CreateRegisterAllocationPass(const CPUIDEmu* CPUID);
 fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures&, OpSize GPROpSize);
 

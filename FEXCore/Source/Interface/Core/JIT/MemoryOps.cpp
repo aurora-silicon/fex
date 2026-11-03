@@ -552,10 +552,47 @@ DEF_OP(LoadNZCV) {
   mrs(Dst, ARMEmitter::SystemRegister::NZCV);
 }
 
+DEF_OP(APFLGFromCompare) {
+  auto Op = IROp->C<IR::IROp_APFLGFromCompare>();
+
+  APFLGFixNarrowCompare(Op->IsAdd, GetZeroableReg(Op->Src1), GetReg(Op->Src2));
+}
+
+DEF_OP(LoadNZCVOnly) {
+  mrs(GetReg(Node), ARMEmitter::SystemRegister::NZCV);
+}
+
 DEF_OP(StoreNZCV) {
   auto Op = IROp->C<IR::IROp_StoreNZCV>();
 
   msr(ARMEmitter::SystemRegister::NZCV, GetReg(Op->Value));
+}
+
+DEF_OP(StoreAPFLG) {
+  auto Op = IROp->C<IR::IROp_StoreAPFLG>();
+
+  // No MSR: an ADDS of T + T computes PF/AF in hardware, and RMIF puts the
+  // rest of NZCV back (RMIF keeps PF/AF). With T = (AF << 3) | (AF XNOR PF)
+  // in the low bits, the sum has bit 4 = AF (the carry out of bit 3), and a
+  // low byte of even parity exactly when PF is set.
+  mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
+  ARMEmitter::Register PF = TMP2;
+  ARMEmitter::Register AF = TMP3;
+  if (Op->Mask & 1) {
+    PF = GetReg(Op->PF);
+  } else {
+    ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 26, 1);
+  }
+  if (Op->Mask & 2) {
+    AF = GetReg(Op->AF);
+  } else {
+    ubfx(ARMEmitter::Size::i32Bit, TMP3, TMP1, 27, 1);
+  }
+  eon(ARMEmitter::Size::i32Bit, TMP4, AF, PF);
+  lsl(ARMEmitter::Size::i32Bit, TMP2, AF, 3);
+  bfi(ARMEmitter::Size::i32Bit, TMP2, TMP4, 0, 1);
+  cmn(ARMEmitter::Size::i32Bit, TMP2, TMP2);
+  rmif(TMP1, 28, 0xf);
 }
 
 DEF_OP(LoadDF) {
