@@ -148,6 +148,19 @@ struct ControlFlowGraph {
   }
 };
 
+// Per-node state of one ProcessBlock call in SolveFromNothingLive, valid where
+// Gen == Run (values are block local). Seen/NeedPA collect the RMIF/BFE users
+// of each LoadNZCV. A dry run tracks removals in Uses instead of the IR.
+struct APFLGScratch {
+  fextl::vector<uint32_t> Gen;
+  fextl::vector<uint32_t> Uses;
+  fextl::vector<uint32_t> Seen;
+  fextl::vector<uint8_t> NeedPA;
+  uint32_t Run = 0;
+  // A kept StoreAPFLG writes back PF/AF its block read, before an in-unit branch.
+  bool WriteBack = false;
+};
+
 class DeadFlagCalculationEliminination final : public FEXCore::IR::Pass {
 public:
   explicit DeadFlagCalculationEliminination(bool APFLG)
@@ -156,19 +169,34 @@ public:
   void Run(IREmitter* IREmit) override;
 
 private:
-  FlagInfo Classify(IROp_Header* Node);
+  template<bool kAPFLG>
+  [[gnu::always_inline]] FlagInfo Classify(IROp_Header* Node);
   unsigned FlagsForCondClassType(CondClass Cond);
-  bool EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp);
+  template<bool kDryRun>
+  [[gnu::always_inline]] bool EliminateDeadCode(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
   CondClass X86ToArmFloatCond(CondClass X86);
+  // kSolve: SolveFromNothingLive, which also narrows LoadNZCV reads and, with
+  // kDryRun, computes the result without changing the IR (APFLG only).
+  template<bool kAPFLG, bool kSolve, bool kDryRun>
   bool ProcessBlock(IREmitter* IREmit, IRListView& CurrentIR, Ref Block, ControlFlowGraph& CFG);
+  void SolveFromNothingLive(IREmitter* IREmit, IRListView& CurrentIR, ControlFlowGraph& CFG);
+  bool IsPFAFWriteBack(IRListView& CurrentIR, IROp_Header* IROp);
   void OptimizeParity(IREmitter* IREmit, IRListView& CurrentIR, ControlFlowGraph& CFG);
 
   // Apple APFLG: x86 PF/AF are host NZCV bits 26/27, which every host flag
   // write also writes (computing or clobbering them).
   const bool APFLG;
-  FlagInfo ClassifyAPFLG(IROp_Header* IROp, FlagInfo Info);
+  [[gnu::always_inline]] FlagInfo ClassifyAPFLG(IROp_Header* IROp, FlagInfo Info);
   FlagInfo ClassifySpecial(IROp_Header* IROp);
+
+  APFLGScratch Scratch;
+  [[gnu::always_inline]] void Touch(uint32_t ID, Ref Node);
+  template<bool kDryRun>
+  [[gnu::always_inline]] uint32_t Uses(IRListView& CurrentIR, Ref Node);
+  template<bool kDryRun>
+  [[gnu::always_inline]] void RemoveNode(IREmitter* IREmit, IRListView& CurrentIR, Ref Node, IROp_Header* IROp);
+  void NoteLoadNZCVUses(IRListView& CurrentIR, IROp_Header* IROp);
 };
 
 unsigned DeadFlagCalculationEliminination::FlagsForCondClassType(CondClass Cond) {
@@ -403,14 +431,15 @@ FlagInfo DeadFlagCalculationEliminination::ClassifyAPFLG(IROp_Header* IROp, Flag
   });
 }
 
+template<bool kAPFLG>
 FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
   FlagInfo Info = FlagInfos[IROp->Op];
   if (!Info.Special()) {
-    return APFLG ? ClassifyAPFLG(IROp, Info) : Info;
+    return kAPFLG ? ClassifyAPFLG(IROp, Info) : Info;
   }
 
   Info = ClassifySpecial(IROp);
-  return APFLG ? ClassifyAPFLG(IROp, Info) : Info;
+  return kAPFLG ? ClassifyAPFLG(IROp, Info) : Info;
 }
 
 FlagInfo DeadFlagCalculationEliminination::ClassifySpecial(IROp_Header* IROp) {
@@ -519,14 +548,101 @@ FlagInfo DeadFlagCalculationEliminination::ClassifySpecial(IROp_Header* IROp) {
 
 // General purpose dead code elimination. Returns whether flag handling should
 // be skipped (because it was removed or could not possibly affect flags).
-bool DeadFlagCalculationEliminination::EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp) {
+template<bool kDryRun>
+bool DeadFlagCalculationEliminination::EliminateDeadCode(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp) {
   // Can't remove anything used or with side effects.
-  if (CodeNode->GetUses() > 0 || IR::HasSideEffects(IROp->Op)) {
+  if (Uses<kDryRun>(CurrentIR, CodeNode) > 0 || IR::HasSideEffects(IROp->Op)) {
     return false;
   }
 
-  IREmit->Remove(CodeNode);
+  RemoveNode<kDryRun>(IREmit, CurrentIR, CodeNode, IROp);
   return true;
+}
+
+void DeadFlagCalculationEliminination::Touch(uint32_t ID, Ref Node) {
+  if (Scratch.Gen[ID] != Scratch.Run) {
+    Scratch.Gen[ID] = Scratch.Run;
+    Scratch.Uses[ID] = Node->GetUses();
+    Scratch.Seen[ID] = 0;
+    Scratch.NeedPA[ID] = 0;
+  }
+}
+
+template<bool kDryRun>
+uint32_t DeadFlagCalculationEliminination::Uses(IRListView& CurrentIR, Ref Node) {
+  if constexpr (kDryRun) {
+    const auto ID = CurrentIR.GetID(Node).Value;
+    Touch(ID, Node);
+    return Scratch.Uses[ID];
+  }
+
+  return Node->GetUses();
+}
+
+template<bool kDryRun>
+void DeadFlagCalculationEliminination::RemoveNode(IREmitter* IREmit, IRListView& CurrentIR, Ref Node, IROp_Header* IROp) {
+  if constexpr (!kDryRun) {
+    IREmit->Remove(Node);
+    return;
+  }
+
+  // Dry run: drop the uses of the arguments, as Remove would.
+  const uint8_t NumArgs = IR::GetArgs(IROp->Op);
+  for (uint8_t i = 0; i < NumArgs; ++i) {
+    if (IROp->Args[i].IsInvalid() || IROp->Args[i].IsImmediate()) {
+      continue;
+    }
+    const auto ID = IROp->Args[i].ID().Value;
+    Touch(ID, CurrentIR.GetNode(IROp->Args[i]));
+    if (Scratch.Uses[ID] > 0) {
+      --Scratch.Uses[ID];
+    }
+  }
+}
+
+// PF/AF bits (FLAG_P/FLAG_A) of its source that an RMIF/BFE/SBFE reads.
+static unsigned APFLGBitsUsed(IROp_Header* User) {
+  constexpr unsigned PFBit = 26;
+  constexpr unsigned AFBit = 27;
+  auto Covers = [](unsigned Lo, unsigned Hi, unsigned Bit) {
+    return Lo <= Bit && Bit < Hi;
+  };
+
+  switch (User->Op) {
+  case OP_RMIFNZCV: {
+    auto Op = User->C<IR::IROp_RmifNZCV>();
+    unsigned Bits = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+      if (Op->Mask & (1u << i)) {
+        const unsigned SrcBit = (i + Op->Rotate) & 63;
+        Bits |= SrcBit == PFBit ? FLAG_P : SrcBit == AFBit ? FLAG_A : 0;
+      }
+    }
+    return Bits;
+  }
+  case OP_BFE:
+  case OP_SBFE: {
+    // Same field layout for both.
+    auto Op = User->C<IR::IROp_Bfe>();
+    const unsigned Lo = Op->lsb, Hi = Op->lsb + Op->Width;
+    return (Covers(Lo, Hi, PFBit) ? FLAG_P : 0u) | (Covers(Lo, Hi, AFBit) ? FLAG_A : 0u);
+  }
+  default: return FLAG_P | FLAG_A;
+  }
+}
+
+void DeadFlagCalculationEliminination::NoteLoadNZCVUses(IRListView& CurrentIR, IROp_Header* IROp) {
+  // Called for RMIF/BFE/SBFE only. Any other user of a LoadNZCV leaves its use
+  // count above Seen, which keeps the PF/AF read.
+  auto Src = IROp->Args[0];
+  if (CurrentIR.GetOp<IROp_Header>(Src)->Op != OP_LOADNZCV) {
+    return;
+  }
+
+  const auto ID = Src.ID().Value;
+  Touch(ID, CurrentIR.GetNode(Src));
+  ++Scratch.Seen[ID];
+  Scratch.NeedPA[ID] |= APFLGBitsUsed(IROp);
 }
 
 CondClass DeadFlagCalculationEliminination::X86ToArmFloatCond(CondClass X86) {
@@ -595,6 +711,7 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
 /**
  * @brief This pass removes dead code locally.
  */
+template<bool kAPFLG, bool kSolve, bool kDryRun>
 bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListView& CurrentIR, Ref Block, ControlFlowGraph& CFG) {
   uint32_t FlagsRead = FLAG_ALL;
 
@@ -607,6 +724,11 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
 
   // Advance past EndBlock to get at the exit.
   --CodeLast;
+
+  if (kSolve && ++Scratch.Run == 0) {
+    std::fill(Scratch.Gen.begin(), Scratch.Gen.end(), 0);
+    Scratch.Run = 1;
+  }
 
   // Initialize the FlagsRead mask according to the exit instruction.
   auto [ExitNode, ExitOp] = CodeLast();
@@ -624,7 +746,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
     // Optimizing flags can cause earlier flag reads to become dead but dead
     // flag reads should not impede optimiation of earlier dead flag writes.
     // We must DCE as we go to ensure we converge in a single iteration.
-    if (!EliminateDeadCode(IREmit, CodeNode, IROp)) {
+    if (!EliminateDeadCode<kDryRun>(IREmit, CurrentIR, CodeNode, IROp)) {
       // Optimiation algorithm: For each flag written...
       //
       //  If the flag has a later read (per FlagsRead), remove the flag from
@@ -638,12 +760,11 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
       // This order is important: instructions that read-modify-write flags
       // (like adcs) first read flags, then write flags. Since we're iterating
       // the block backwards, that means we handle the write first.
-      struct FlagInfo Info = Classify(IROp);
+      struct FlagInfo Info = Classify<kAPFLG>(IROp);
 
       // APFLG: these keep PF/AF when their condition fails, and PF/AF feed
       // only their own PF/AF, so they read PF/AF only if those are needed later.
-      if (APFLG && !(FlagsRead & (FLAG_P | FLAG_A)) &&
-          (IROp->Op == OP_CONDADDNZCV || IROp->Op == OP_CONDSUBNZCV || IROp->Op == OP_SHIFTFLAGS)) {
+      if (kAPFLG && !(FlagsRead & (FLAG_P | FLAG_A)) && (IROp->Op == OP_CONDADDNZCV || IROp->Op == OP_CONDSUBNZCV || IROp->Op == OP_SHIFTFLAGS)) {
         Info = FlagInfo::Pack({
           .Read = Info.Read() & ~(FLAG_P | FLAG_A),
           .Write = Info.Write(),
@@ -653,17 +774,29 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         });
       }
 
-      if (!Info.Trivial()) {
-        bool Eliminated = false;
+      // APFLG: a LoadNZCV reads PF/AF only for users of bits 26/27, such as
+      // the PF/AF a following ADCX/ADOX keeps. RMIF #28 reads bits 28-31.
+      if (kSolve && IROp->Op == OP_LOADNZCV) {
+        const auto ID = CurrentIR.GetID(CodeNode).Value;
+        Touch(ID, CodeNode);
+        if (Scratch.Seen[ID] == Uses<kDryRun>(CurrentIR, CodeNode)) {
+          Info = FlagInfo::Pack({.Read = FLAG_NZCV | Scratch.NeedPA[ID]});
+          if (!kDryRun && !Scratch.NeedPA[ID]) {
+            IROp->Op = OP_LOADNZCVONLY;
+          }
+        }
+      }
 
+      bool Eliminated = false;
+      if (!Info.Trivial()) {
         if ((FlagsRead & Info.Write()) == 0) {
-          if ((Info.CanEliminate() || Info.Replacement()) && CodeNode->GetUses() == 0) {
-            IREmit->Remove(CodeNode);
+          if ((Info.CanEliminate() || Info.Replacement()) && Uses<kDryRun>(CurrentIR, CodeNode) == 0) {
+            RemoveNode<kDryRun>(IREmit, CurrentIR, CodeNode, IROp);
             Eliminated = true;
-          } else if (Info.Replacement()) {
+          } else if (Info.Replacement() && !kDryRun) {
             IROp->Op = Info.Replacement();
           }
-        } else if (Info.ReplacementNoWrite() && CodeNode->GetUses() == 0) {
+        } else if (Info.ReplacementNoWrite() && CodeNode->GetUses() == 0 && !kDryRun) {
           IROp->Op = Info.ReplacementNoWrite();
         }
 
@@ -672,7 +805,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         // this flag is outside of the if, since the TestNZ might result from
         // optimizing AndWithFlags, and we need to converge locally in a single
         // iteration.
-        if (IROp->Op == OP_TESTNZ && IROp->Size < OpSize::i32Bit && !(FlagsRead & (FLAG_N | FLAG_C))) {
+        if (IROp->Op == OP_TESTNZ && IROp->Size < OpSize::i32Bit && !(FlagsRead & (FLAG_N | FLAG_C)) && !kDryRun) {
           IROp->Op = OP_TESTZ;
         }
 
@@ -684,6 +817,12 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         if (!Eliminated) {
           FlagsRead |= Info.Read();
         }
+      }
+
+      if (kSolve && !Eliminated && (IROp->Op == OP_RMIFNZCV || IROp->Op == OP_BFE || IROp->Op == OP_SBFE)) {
+        NoteLoadNZCVUses(CurrentIR, IROp);
+      } else if (kAPFLG && !kSolve && !Eliminated && IROp->Op == OP_STOREAPFLG && (ExitOp->Op == OP_JUMP || ExitOp->Op == OP_CONDJUMP)) {
+        Scratch.WriteBack |= IsPFAFWriteBack(CurrentIR, IROp);
       }
     }
 
@@ -767,11 +906,69 @@ void DeadFlagCalculationEliminination::OptimizeParity(IREmitter* IREmit, IRListV
   }
 }
 
+// Whether a StoreAPFLG writes back the PF/AF that a LoadNZCV of its block
+// read, the pattern SolveFromNothingLive can remove from loops.
+bool DeadFlagCalculationEliminination::IsPFAFWriteBack(IRListView& CurrentIR, IROp_Header* IROp) {
+  auto IsLoadedBit = [&](OrderedNodeWrapper Arg, unsigned Bit) {
+    auto Op = CurrentIR.GetOp<IROp_Header>(Arg);
+    if (Op->Op != OP_BFE) {
+      return false;
+    }
+    auto Bfe = Op->C<IR::IROp_Bfe>();
+    return Bfe->Width == 1 && Bfe->lsb == Bit && CurrentIR.GetOp<IROp_Header>(Bfe->Src)->Op == OP_LOADNZCV;
+  };
+
+  auto Op = IROp->C<IR::IROp_StoreAPFLG>();
+  return (!(Op->Mask & 1) || IsLoadedBit(Op->PF, 26)) && (!(Op->Mask & 2) || IsLoadedBit(Op->AF, 27));
+}
+
+void DeadFlagCalculationEliminination::SolveFromNothingLive(IREmitter* IREmit, IRListView& CurrentIR, ControlFlowGraph& CFG) {
+  // The worklist above starts from "all flags live", so flags that only go
+  // around a loop stay live: ADCX/ADOX keep PF/AF, and each block then writes
+  // back the PF/AF the next one reads. Solve again starting from "nothing
+  // live", without changing the IR, then apply the result. Unit exits still
+  // read every flag. This also counts a LoadNZCV as reading PF/AF only for
+  // RMIF/BFE users of bits 26/27, so the PF/AF that ADCX/ADOX keep do not
+  // count as read when they are dead afterwards.
+  const auto Count = CurrentIR.GetSSACount();
+  if (Scratch.Gen.size() < Count) {
+    Scratch.Gen.resize(Count);
+    Scratch.Uses.resize(Count);
+    Scratch.Seen.resize(Count);
+    Scratch.NeedPA.resize(Count);
+  }
+
+  fextl::deque<uint32_t> Worklist;
+  for (uint32_t ID = 0; ID < CFG.BlockMap.size(); ++ID) {
+    CFG.BlockMap[ID].Flags = 0;
+    CFG.BlockMap[ID].InWorklist = true;
+    Worklist.push_back(ID);
+  }
+
+  for (; !Worklist.empty(); Worklist.pop_back()) {
+    auto Block = Worklist.back();
+    auto Info = CFG.Get(Block);
+    Info->InWorklist = false;
+
+    if (ProcessBlock<true, true, true>(IREmit, CurrentIR, Info->Node, CFG)) {
+      for (auto Pred : Info->Predecessors) {
+        CFG.AddWorklist(Worklist, Pred);
+      }
+    }
+  }
+
+  for (uint32_t ID = 0; ID < CFG.BlockMap.size(); ++ID) {
+    ProcessBlock<true, true, false>(IREmit, CurrentIR, CFG.BlockMap[ID].Node, CFG);
+  }
+}
+
 void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   FEXCORE_PROFILE_SCOPED("PassManager::DFE");
 
   auto CurrentIR = IREmit->ViewIR();
   fextl::deque<uint32_t> Worklist;
+
+  Scratch.WriteBack = false;
 
   // Initialize CFG
   ControlFlowGraph CFG {.IR = CurrentIR};
@@ -803,11 +1000,16 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
     auto Info = CFG.Get(Block);
     Info->InWorklist = false;
 
-    if (ProcessBlock(IREmit, CurrentIR, Info->Node, CFG)) {
+    if (APFLG ? ProcessBlock<true, false, false>(IREmit, CurrentIR, Info->Node, CFG) :
+                ProcessBlock<false, false, false>(IREmit, CurrentIR, Info->Node, CFG)) {
       for (auto Pred : Info->Predecessors) {
         CFG.AddWorklist(Worklist, Pred);
       }
     }
+  }
+
+  if (APFLG && Scratch.WriteBack && CFG.BlockMap.size() > 1) {
+    SolveFromNothingLive(IREmit, CurrentIR, CFG);
   }
 
   // Fold compares into branches now that we're otherwise optimized. This needs
