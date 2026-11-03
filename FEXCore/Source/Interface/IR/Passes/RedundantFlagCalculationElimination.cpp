@@ -150,6 +150,9 @@ struct ControlFlowGraph {
 
 class DeadFlagCalculationEliminination final : public FEXCore::IR::Pass {
 public:
+  explicit DeadFlagCalculationEliminination(bool APFLG)
+    : APFLG {APFLG} { }
+
   void Run(IREmitter* IREmit) override;
 
 private:
@@ -160,6 +163,12 @@ private:
   CondClass X86ToArmFloatCond(CondClass X86);
   bool ProcessBlock(IREmitter* IREmit, IRListView& CurrentIR, Ref Block, ControlFlowGraph& CFG);
   void OptimizeParity(IREmitter* IREmit, IRListView& CurrentIR, ControlFlowGraph& CFG);
+
+  // Apple APFLG: x86 PF/AF are host NZCV bits 26/27, which every host flag
+  // write also writes (computing or clobbering them).
+  const bool APFLG;
+  FlagInfo ClassifyAPFLG(IROp_Header* IROp, FlagInfo Info);
+  FlagInfo ClassifySpecial(IROp_Header* IROp);
 };
 
 unsigned DeadFlagCalculationEliminination::FlagsForCondClassType(CondClass Cond) {
@@ -343,12 +352,59 @@ constexpr auto FlagInfos = [] {
   return ret;
 }();
 
-FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
-  FlagInfo Info = FlagInfos[IROp->Op];
-  if (!Info.Special()) {
+FlagInfo DeadFlagCalculationEliminination::ClassifyAPFLG(IROp_Header* IROp, FlagInfo Info) {
+  unsigned Read = Info.Read();
+  unsigned Write = Info.Write();
+
+  switch (IROp->Op) {
+  case OP_RMIFNZCV:
+  case OP_CARRYINVERT:
+  case OP_ROTATEFLAGS:
+  case OP_CMPPAIRZ:
+    // RMIF/CFINV keep bits 26/27; CmpPairZ restores them.
+    return Info;
+
+  case OP_LOADNZCV: Read |= FLAG_P | FLAG_A; break;
+
+  case OP_CONDADDNZCV:
+  case OP_CONDSUBNZCV:
+  case OP_SHIFTFLAGS:
+    // Conditionally computes PF/AF, else keeps them.
+    Read |= FLAG_P | FLAG_A;
+    Write |= FLAG_P | FLAG_A;
+    break;
+
+  default:
+    if (Write & FLAG_NZCV) {
+      Write |= FLAG_P | FLAG_A;
+    }
+    break;
+  }
+
+  if (Read == Info.Read() && Write == Info.Write()) {
     return Info;
   }
 
+  return FlagInfo::Pack({
+    .Read = Read,
+    .Write = Write,
+    .CanEliminate = Info.CanEliminate(),
+    .Replacement = Info.Replacement(),
+    .ReplacementNoWrite = Info.ReplacementNoWrite(),
+  });
+}
+
+FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
+  FlagInfo Info = FlagInfos[IROp->Op];
+  if (!Info.Special()) {
+    return APFLG ? ClassifyAPFLG(IROp, Info) : Info;
+  }
+
+  Info = ClassifySpecial(IROp);
+  return APFLG ? ClassifyAPFLG(IROp, Info) : Info;
+}
+
+FlagInfo DeadFlagCalculationEliminination::ClassifySpecial(IROp_Header* IROp) {
   switch (IROp->Op) {
   case OP_NZCVSELECT:
   case OP_NZCVSELECTINCREMENT: {
@@ -737,19 +793,22 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
       auto Op = ExitOp->CW<IR::IROp_CondJump>();
       uint32_t FlagsOut = CFG.Get(Op->TrueBlock)->Flags | CFG.Get(Op->FalseBlock)->Flags;
 
-      if ((FlagsOut & FLAG_NZCV) == 0 && Op->FromNZCV) {
+      const unsigned LiveHostFlags = FLAG_NZCV | (APFLG ? (FLAG_P | FLAG_A) : 0);
+      if ((FlagsOut & LiveHostFlags) == 0 && Op->FromNZCV) {
         FoldBranch(IREmit, CurrentIR, Op, ExitNode);
       }
     }
   }
 
-  if (CurrentIR.GetHeader()->ReadsParity) {
+  // The parity optimization works on the deferred raw PF, which APFLG
+  // replaces with NZCV bit 26.
+  if (CurrentIR.GetHeader()->ReadsParity && !APFLG) {
     OptimizeParity(IREmit, CurrentIR, CFG);
   }
 }
 
-fextl::unique_ptr<Pass> CreateDeadFlagCalculationEliminination() {
-  return fextl::make_unique<DeadFlagCalculationEliminination>();
+fextl::unique_ptr<Pass> CreateDeadFlagCalculationEliminination(bool APFLG) {
+  return fextl::make_unique<DeadFlagCalculationEliminination>(APFLG);
 }
 
 } // namespace FEXCore::IR

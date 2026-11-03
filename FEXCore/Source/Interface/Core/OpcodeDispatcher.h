@@ -1138,6 +1138,11 @@ public:
     Multiblock = _Multiblock;
   }
 
+  // Apple APFLG: with the extension on, x86 PF and AF live in host NZCV bits
+  // 26 and 27 (as true values) instead of in the deferred raw registers.
+  static constexpr unsigned APFLG_PF_BIT = 26;
+  static constexpr unsigned APFLG_AF_BIT = 27;
+
   static inline constexpr unsigned IndexNZCV(unsigned BitOffset) {
     switch (BitOffset) {
     case FEXCore::X86State::RFLAG_OF_RAW_LOC: return 28;
@@ -1724,6 +1729,31 @@ private:
     NZCVDirty = true;
   }
 
+  bool APFLG() const {
+    return CTX->HostFeatures.SupportsAPFLG;
+  }
+
+  // APFLG: operands of the pending AF, consumed by the next CalculatePF.
+  struct {
+    Ref Src1, Src2;
+  } PendingAF {};
+
+  // APFLG: insert 0/1 values of PF and/or AF (nullptr keeps the flag).
+  void SetAPFLGBits(Ref PF, Ref AF) {
+    Ref NZCV = GetNZCV();
+    if (PF) {
+      NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_PF_BIT, NZCV, PF);
+    }
+    if (AF) {
+      NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_AF_BIT, NZCV, AF);
+    }
+    SetNZCV(NZCV);
+  }
+
+  Ref GetAPFLGBit(unsigned Bit) {
+    return _Bfe(OpSize::i32Bit, 1, Bit, GetNZCV());
+  }
+
   void SetNZ_ZeroCV(IR::OpSize SrcSize, Ref Res, bool SetPF = false) {
     HandleNZ00Write();
 
@@ -1733,7 +1763,7 @@ private:
     // This is currently worse for 8/16-bit, but that should be optimized. TODO
     if (SrcSize >= OpSize::i32Bit) {
       if (SetPF) {
-        CalculatePF(SubWithFlags(SrcSize, Res, (uint64_t)0));
+        CalculatePFAFFromHost(SubWithFlags(SrcSize, Res, (uint64_t)0));
       } else {
         _SubNZCV(SrcSize, Res, Constant(0));
       }
@@ -1744,7 +1774,7 @@ private:
       CFInverted = false;
 
       if (SetPF) {
-        CalculatePF(Res);
+        CalculatePFAFFromHost(Res);
       }
     }
   }
@@ -1864,8 +1894,10 @@ private:
     }
 
     if (BitOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw PF write with APFLG");
       StoreRegister(Core::CPUState::PF_AS_GREG, false, Value);
     } else if (BitOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw AF write with APFLG");
       StoreRegister(Core::CPUState::AF_AS_GREG, false, Value);
     } else if (BitOffset == FEXCore::X86State::RFLAG_DF_RAW_LOC) {
       // For DF, we need to transform 0/1 into 1/-1
@@ -1884,6 +1916,11 @@ private:
   }
 
   void SetAF(unsigned K) {
+    if (APFLG()) {
+      SetAPFLGBits(nullptr, Constant(K));
+      return;
+    }
+
     // AF is stored in bit 4 of the AF flag byte, with garbage in the other
     // bits. This allows us to defer the extract in the usual case. When it is
     // read, bit 4 is extracted.  In order to write a constant value of AF, that
@@ -2134,8 +2171,10 @@ private:
         return _NZCVSelect01(CondForNZCVBit(BitOffset, Invert));
       }
     } else if (BitOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw PF read with APFLG");
       return LoadGPR(Core::CPUState::PF_AS_GREG);
     } else if (BitOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw AF read with APFLG");
       return LoadGPR(Core::CPUState::AF_AS_GREG);
     } else if (BitOffset == FEXCore::X86State::RFLAG_DF_RAW_LOC) {
       // Recover the sign bit, it is the logical DF value
@@ -2205,6 +2244,15 @@ private:
     // We set PF to unordered (V), but our PF representation is inverted so we
     // actually set to !V. This is one instruction with the VC cond code.
     Ref V_inv = GetRFLAG(FEXCore::X86State::RFLAG_OF_RAW_LOC, true);
+    if (APFLG()) {
+      // PF = unordered (V) and AF = 0 go into NZCV after AXFLAG below, which
+      // clobbers them.
+      Ref Unordered = GetRFLAG(FEXCore::X86State::RFLAG_OF_RAW_LOC);
+      _AXFlag(CTX->HostFeatures.SupportsFlagM2 ? Invalid() : V_inv);
+      CFInverted = true;
+      SetAPFLGBits(Unordered, Constant(0));
+      return;
+    }
     SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(V_inv);
 
     // Intel: OF, SF, and AF set to zero
@@ -2256,6 +2304,14 @@ private:
   // Helper to store a variable shift and calculate its flags for a variable
   // shift, with correct PF handling.
   void HandleShift(X86Tables::DecodedOp Op, Ref Result, Ref Dest, ShiftType Shift, Ref Src) {
+    if (APFLG()) {
+      // The lowering leaves PF (and AF = 0) in NZCV, or keeps both for a zero
+      // shift. Its GPR result is unused.
+      HandleNZCV_RMW();
+      _ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, Constant(0), CFInverted);
+      StoreResultGPR(Op, Result);
+      return;
+    }
 
     auto OldPF = GetRFLAG(X86State::RFLAG_PF_RAW_LOC);
 
@@ -2415,6 +2471,9 @@ private:
   void SetAFAndFixup(Ref AF);
   Ref CalculateAFForDecimal(Ref A);
   void CalculatePF(Ref Res);
+  // PF/AF of Res were just computed by the host flag operation that produced
+  // it (APFLG); otherwise the same as CalculatePF.
+  void CalculatePFAFFromHost(Ref Res);
   void CalculateAF(Ref Src1, Ref Src2);
 
   Ref IncrementByCarry(OpSize OpSize, Ref Src);

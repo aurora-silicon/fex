@@ -109,6 +109,24 @@ DEF_OP(AddShift) {
   add(ConvertSize48(IROp), GetReg(Node), GetReg(Op->Src1), GetReg(Op->Src2), ConvertIRShiftType(Op->Shift), Op->ShiftAmount);
 }
 
+void Arm64JITCore::APFLGFixNarrowCompare(bool IsAdd, ARMEmitter::Register Src1, ARMEmitter::Register Src2) {
+  mrs(TMP2, ARMEmitter::SystemRegister::NZCV);
+  if (IsAdd) {
+    cmn(ARMEmitter::Size::i32Bit, Src1, Src2);
+  } else {
+    cmp(ARMEmitter::Size::i32Bit, Src1, Src2);
+  }
+  rmif(TMP2, 28, 0xf /* NZCV */);
+}
+
+void Arm64JITCore::APFLGTestNarrow(IR::OpSize OpSize, ARMEmitter::Register Src) {
+  const unsigned Bits = IR::OpSizeAsBits(OpSize);
+  // TST of the low bits: Z, PF and AF=0 are right, C=V=0, N is clear.
+  tst(ARMEmitter::Size::i32Bit, Src, (1u << Bits) - 1);
+  // N = sign bit of the narrow value.
+  rmif(Src.X(), Bits - 4, 1 << 3 /* Nzcv */);
+}
+
 DEF_OP(AddNZCV) {
   auto Op = IROp->C<IR::IROp_AddNZCV>();
 
@@ -124,6 +142,10 @@ DEF_OP(AddNZCV) {
 
     lsl(ARMEmitter::Size::i32Bit, TMP1, Src1, Shift);
     cmn(EmitSize, TMP1, GetReg(Op->Src2), ARMEmitter::ShiftType::LSL, Shift);
+
+    if (HostSupportsAPFLG) {
+      APFLGFixNarrowCompare(true, Src1, GetReg(Op->Src2));
+    }
   } else {
     cmn(EmitSize, Src1, GetReg(Op->Src2));
   }
@@ -204,8 +226,12 @@ DEF_OP(TestNZ) {
       Src1 = TMP1;
     }
 
-    unsigned Shift = 32 - IR::OpSizeAsBits(IROp->Size);
-    cmn(EmitSize, ARMEmitter::Reg::zr, Src1, ARMEmitter::ShiftType::LSL, Shift);
+    if (HostSupportsAPFLG) {
+      APFLGTestNarrow(IROp->Size, Src1);
+    } else {
+      unsigned Shift = 32 - IR::OpSizeAsBits(IROp->Size);
+      cmn(EmitSize, ARMEmitter::Reg::zr, Src1, ARMEmitter::ShiftType::LSL, Shift);
+    }
   } else {
     if (IsInlineConstant(Op->Src2, &Const)) {
       tst(EmitSize, Src1, Const);
@@ -268,6 +294,10 @@ DEF_OP(SubNZCV) {
 
     if (OpSize < IR::OpSize::i32Bit) {
       cmp(EmitSize, ShiftedSrc1, GetReg(Op->Src2), ARMEmitter::ShiftType::LSL, Shift);
+
+      if (HostSupportsAPFLG) {
+        APFLGFixNarrowCompare(false, GetZeroableReg(Op->Src1), GetReg(Op->Src2));
+      }
     } else {
       cmp(EmitSize, ShiftedSrc1, GetReg(Op->Src2));
     }
@@ -285,8 +315,9 @@ DEF_OP(CmpPairZ) {
   cmp(EmitSize, GetReg(Op->Src1Lo), GetReg(Op->Src2Lo));
   ccmp(EmitSize, GetReg(Op->Src1Hi), GetReg(Op->Src2Hi), ARMEmitter::StatusFlags::None, ARMEmitter::Condition::CC_EQ);
 
-  // Restore NzCV
-  if (CTX->HostFeatures.SupportsFlagM) {
+  // Restore NzCV. Under APFLG the compares also clobbered PF/AF, which RMIF
+  // cannot restore, so take the MSR path.
+  if (CTX->HostFeatures.SupportsFlagM && !HostSupportsAPFLG) {
     rmif(TMP1, 28, 0xb /* NzCV */);
   } else {
     cset(ARMEmitter::Size::i32Bit, TMP2, ARMEmitter::Condition::CC_EQ);
@@ -523,8 +554,12 @@ DEF_OP(AndWithFlags) {
       }
     }
 
-    unsigned Shift = 32 - IR::OpSizeAsBits(OpSize);
-    cmn(EmitSize, ARMEmitter::Reg::zr, Dst, ARMEmitter::ShiftType::LSL, Shift);
+    if (HostSupportsAPFLG) {
+      APFLGTestNarrow(OpSize, Dst);
+    } else {
+      unsigned Shift = 32 - IR::OpSizeAsBits(OpSize);
+      cmn(EmitSize, ARMEmitter::Reg::zr, Dst, ARMEmitter::ShiftType::LSL, Shift);
+    }
   } else {
     if (IsInlineConstant(Op->Src2, &Const)) {
       ands(EmitSize, Dst, Src1, Const);
@@ -614,8 +649,12 @@ DEF_OP(ShiftFlags) {
     if (OpSize >= IR::OpSize::i32Bit) {
       ands(EmitSize, PFTemp, Dst, Dst);
     } else {
-      unsigned Shift = 32 - (IR::OpSizeToSize(OpSize) * 8);
-      cmn(EmitSize, ARMEmitter::Reg::zr, Dst, ARMEmitter::ShiftType::LSL, Shift);
+      if (HostSupportsAPFLG) {
+        APFLGTestNarrow(OpSize, Dst);
+      } else {
+        unsigned Shift = 32 - (IR::OpSizeToSize(OpSize) * 8);
+        cmn(EmitSize, ARMEmitter::Reg::zr, Dst, ARMEmitter::ShiftType::LSL, Shift);
+      }
       mov(ARMEmitter::Size::i64Bit, PFTemp, Dst);
     }
 

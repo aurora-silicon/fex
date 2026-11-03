@@ -69,6 +69,16 @@ private:
   const bool HostSupportsAVX256 {};
   const bool HostSupportsRPRES {};
   const bool HostSupportsAFP {};
+  // Apple APFLG: guest PF/AF live in NZCV bits 26/27, so 8/16-bit flag
+  // operations must leave the x86 values of the narrow result there.
+  const bool HostSupportsAPFLG {};
+
+  // APFLG: after a shifted 8/16-bit compare set NZCV, recompute PF/AF with the
+  // unshifted 32-bit form (they only depend on the low bits) and put NZCV back
+  // with RMIF, which leaves bits 26/27 alone.
+  void APFLGFixNarrowCompare(bool IsAdd, ARMEmitter::Register Src1, ARMEmitter::Register Src2);
+  // APFLG: NZ of an 8/16-bit value with C=V=0 and x86 PF/AF (AF=0).
+  void APFLGTestNarrow(IR::OpSize OpSize, ARMEmitter::Register Src);
 
   struct RestartOptions {
     enum class Control : uint64_t {

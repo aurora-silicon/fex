@@ -17,6 +17,11 @@
 #include "Common/X86Features.h"
 #endif
 
+#if defined(ARCHITECTURE_arm64) && !defined(_WIN32) && !defined(VIXL_SIMULATOR)
+#include <sys/auxv.h>
+#include <sys/prctl.h>
+#endif
+
 namespace FEX {
 
 void FillMIDRInformationViaLinux(FEXCore::HostFeatures* Features) {
@@ -376,6 +381,7 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
   ENABLE_DISABLE_OPTION(SupportsMOPS, MOPS, MOPS);
   ENABLE_DISABLE_OPTION(SupportsI8MM, I8MM, I8MM);
   ENABLE_DISABLE_OPTION(SupportsDotProd, DOTPROD, DOTPROD);
+  ENABLE_DISABLE_OPTION(SupportsAPFLG, APFLG, APFLG);
   GET_SINGLE_OPTION(Crypto, CRYPTO);
 
 #undef ENABLE_DISABLE_OPTION
@@ -595,8 +601,28 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsFloatExceptions = true;
 #endif
 
+#if defined(ARCHITECTURE_arm64) && !defined(_WIN32) && !defined(VIXL_SIMULATOR)
+  // Apple's x86 parity/adjust flags (APFLG). An Aurora kernel advertises it as
+  // HWCAP3_APPLE_APFLG and turns it on per thread with PR_AURORA_SET_X86_FLAGS;
+  // the setting is inherited by threads created afterwards and reset by execve.
+  // The JIT relies on FlagM (RMIF) to restore NZCV around 8/16-bit flags.
+  constexpr unsigned long AT_HWCAP3_ = 29;
+  constexpr unsigned long HWCAP3_APPLE_APFLG = 1UL << 63;
+  HostFeatures.SupportsAPFLG = (getauxval(AT_HWCAP3_) & HWCAP3_APPLE_APFLG) && HostFeatures.SupportsFlagM;
+#endif
+
   HandleErrata(&HostFeatures, MIDR);
   OverrideFeatures(&HostFeatures, ForceSVEWidth());
+
+#if defined(ARCHITECTURE_arm64) && !defined(_WIN32) && !defined(VIXL_SIMULATOR)
+  if (HostFeatures.SupportsAPFLG && !HostFeatures.IsInstCountCI) {
+    constexpr int PR_AURORA_SET_X86_FLAGS = 0x41555006;
+    if (prctl(PR_AURORA_SET_X86_FLAGS, 1, 0, 0, 0) != 0 && (getauxval(AT_HWCAP3_) & HWCAP3_APPLE_APFLG)) {
+      // Advertised but refused: run without it rather than with wrong PF/AF.
+      HostFeatures.SupportsAPFLG = false;
+    }
+  }
+#endif
 }
 
 FEXCore::HostFeatures FetchHostFeatures() {

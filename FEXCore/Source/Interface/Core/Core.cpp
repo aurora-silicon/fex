@@ -242,15 +242,23 @@ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadSt
   EFLAGS |= ZF << X86State::RFLAG_ZF_RAW_LOC;
   EFLAGS |= SF << X86State::RFLAG_SF_RAW_LOC;
 
-  // PF calculation is deferred, calculate it now.
-  // Popcount the 8-bit flag and then extract the lower bit.
-  uint32_t PFByte = Frame->State.pf_raw & 0xff;
-  uint32_t PF = std::popcount(PFByte ^ 1) & 1;
-  EFLAGS |= PF << X86State::RFLAG_PF_RAW_LOC;
+  uint32_t PF, AF;
+  if (HostFeatures.SupportsAPFLG) {
+    // Apple APFLG: PF and AF are in NZCV bits 26 and 27, which the kernel also
+    // reports in PSTATE.
+    PF = (Packed_NZCV >> IR::OpDispatchBuilder::APFLG_PF_BIT) & 1;
+    AF = (Packed_NZCV >> IR::OpDispatchBuilder::APFLG_AF_BIT) & 1;
+  } else {
+    // PF calculation is deferred, calculate it now.
+    // Popcount the 8-bit flag and then extract the lower bit.
+    uint32_t PFByte = Frame->State.pf_raw & 0xff;
+    PF = std::popcount(PFByte ^ 1) & 1;
 
-  // AF calculation is deferred, calculate it now.
-  // XOR with PF byte and extract bit 4.
-  uint32_t AF = ((Frame->State.af_raw ^ PFByte) & (1 << 4)) ? 1 : 0;
+    // AF calculation is deferred, calculate it now.
+    // XOR with PF byte and extract bit 4.
+    AF = ((Frame->State.af_raw ^ PFByte) & (1 << 4)) ? 1 : 0;
+  }
+  EFLAGS |= PF << X86State::RFLAG_PF_RAW_LOC;
   EFLAGS |= AF << X86State::RFLAG_AF_RAW_LOC;
 
   uint8_t TFByte = Frame->State.flags[X86State::RFLAG_TF_RAW_LOC];
@@ -348,6 +356,11 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
   Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_CF_RAW_LOC)) ? 0 : 1U << IR::OpDispatchBuilder::IndexNZCV(X86State::RFLAG_CF_RAW_LOC);
   Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_ZF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::IndexNZCV(X86State::RFLAG_ZF_RAW_LOC) : 0;
   Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_SF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::IndexNZCV(X86State::RFLAG_SF_RAW_LOC) : 0;
+  if (HostFeatures.SupportsAPFLG) {
+    // Apple APFLG: PF and AF live in NZCV bits 26 and 27.
+    Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_PF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::APFLG_PF_BIT : 0;
+    Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_AF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::APFLG_AF_BIT : 0;
+  }
   memcpy(&Frame->State.flags[X86State::RFLAG_NZCV_LOC], &Packed_NZCV, sizeof(Packed_NZCV));
 
   // Reserved, Read-As-1, Write-as-1

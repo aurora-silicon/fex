@@ -250,8 +250,12 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     HandleNZCV_RMW();
     RectifyCarryInvert(true);
     Result = _AdcZeroWithFlags(OpSize, Before);
-    SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Before);
-    CalculatePF(Result);
+    if (APFLG()) {
+      CalculatePFAFFromHost(Result);
+    } else {
+      SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Before);
+      CalculatePF(Result);
+    }
     CFInverted = false;
   } else {
     Result = CalculateFlags_ADC(Size, Before, Src);
@@ -1021,11 +1025,15 @@ void OpDispatchBuilder::TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
   } else if (Size < OpSize::i32Bit && AlwaysNonnegative) {
     // If we know the result is always nonnegative, we can use a 32-bit test.
     auto Res = _And(OpSize::i32Bit, Dest, Src);
-    CalculatePF(Res);
-    SetNZ_ZeroCV(OpSize::i32Bit, Res);
+    if (APFLG()) {
+      SetNZP_ZeroCV(OpSize::i32Bit, Res);
+    } else {
+      CalculatePF(Res);
+      SetNZ_ZeroCV(OpSize::i32Bit, Res);
+    }
   } else {
     HandleNZ00Write();
-    CalculatePF(_AndWithFlags(Size, Dest, Src));
+    CalculatePFAFFromHost(_AndWithFlags(Size, Dest, Src));
   }
 
   InvalidateAF();
@@ -1979,6 +1987,11 @@ void OpDispatchBuilder::ADXOp(OpcodeArgs) {
     }
 
     _RmifNZCV(OldNZCV, 28, IsADCX ? 0xd /* NzcV */ : 0xe /* NZCv */);
+
+    if (APFLG()) {
+      // RMIF restores NZCV only; put back the PF/AF that ADCS clobbered.
+      SetNZCV(_Bfi(OpSize::i32Bit, 2, APFLG_PF_BIT, GetNZCV(), _Lshr(OpSize::i32Bit, OldNZCV, Constant(APFLG_PF_BIT))));
+    }
   } else {
     // For either operation, insert the new flag into the old NZCV.
     bool SavedCFInvert = CFInverted;
@@ -2891,7 +2904,7 @@ void OpDispatchBuilder::DAAOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, AL, OpSize::i8Bit);
   SetNZ_ZeroCV(OpSize::i8Bit, AL);
   SetCFInverted(CFInv);
-  CalculatePF(AL);
+  CalculatePFAFFromHost(AL);
   SetAFAndFixup(AF);
 }
 
@@ -2917,7 +2930,7 @@ void OpDispatchBuilder::DASOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, AL, OpSize::i8Bit);
   SetNZ_ZeroCV(OpSize::i8Bit, AL);
   SetCFDirect(NewCF);
-  CalculatePF(AL);
+  CalculatePFAFFromHost(AL);
   SetAFAndFixup(AF);
 }
 
@@ -2965,7 +2978,7 @@ void OpDispatchBuilder::AAMOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, Res, OpSize::i16Bit);
 
   SetNZ_ZeroCV(OpSize::i8Bit, Res);
-  CalculatePF(Res);
+  CalculatePFAFFromHost(Res);
   InvalidateAF();
 }
 
@@ -2978,7 +2991,7 @@ void OpDispatchBuilder::AADOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, Result, OpSize::i16Bit);
 
   SetNZ_ZeroCV(OpSize::i8Bit, Result);
-  CalculatePF(Result);
+  CalculatePFAFFromHost(Result);
   InvalidateAF();
 }
 
@@ -3178,8 +3191,10 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Addition producing upper garbage
     Result = Add(OpSize::i32Bit, Dest, 1);
-    CalculatePF(Result);
-    CalculateAF(Dest, Constant(1));
+    if (!APFLG()) {
+      CalculatePF(Result);
+      CalculateAF(Dest, Constant(1));
+    }
 
     // Correctly set NZ flags, preserving C
     HandleNZCV_RMW();
@@ -3188,6 +3203,12 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
     // Fix up V flag. INC overflows only when incrementing a positive and
     // getting a negative. So compare the sign bits to calculate V.
     _RmifNZCV(_Andn(OpSize::i32Bit, Result, Dest), Size - 1, 1);
+
+    // SETF8/SETF16 clobber PF under APFLG, so insert PF/AF afterwards.
+    if (APFLG()) {
+      CalculateAF(Dest, Constant(1));
+      CalculatePF(Result);
+    }
   } else {
     Result = CalculateFlags_ADD(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
@@ -3219,8 +3240,10 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Subtraction producing upper garbage
     Result = Sub(OpSize::i32Bit, Dest, 1);
-    CalculatePF(Result);
-    CalculateAF(Dest, Constant(1));
+    if (!APFLG()) {
+      CalculatePF(Result);
+      CalculateAF(Dest, Constant(1));
+    }
 
     // Correctly set NZ flags, preserving C
     HandleNZCV_RMW();
@@ -3229,6 +3252,12 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
     // Fix up V flag. DEC overflows only when decrementing a negative and
     // getting a positive. So compare the sign bits to calculate V.
     _RmifNZCV(_Andn(OpSize::i32Bit, Dest, Result), Size - 1, 1);
+
+    // SETF8/SETF16 clobber PF under APFLG, so insert PF/AF afterwards.
+    if (APFLG()) {
+      CalculateAF(Dest, Constant(1));
+      CalculatePF(Result);
+    }
   } else {
     Result = CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
@@ -4729,7 +4758,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
     auto Zero = LoadGPR(Op->Dest.Data.GPR.GPR);
     HandleNZ00Write();
     InvalidateAF();
-    CalculatePF(SubWithFlags(OpSize::i32Bit, Zero, Zero));
+    CalculatePFAFFromHost(SubWithFlags(OpSize::i32Bit, Zero, Zero));
     CFInverted = true;
     FlushRegisterCache();
 
@@ -4811,7 +4840,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
   }
   case FEXCore::IR::IROps::OP_ANDWITHFLAGS: {
     HandleNZ00Write();
-    CalculatePF(Result);
+    CalculatePFAFFromHost(Result);
     InvalidateAF();
     break;
   }

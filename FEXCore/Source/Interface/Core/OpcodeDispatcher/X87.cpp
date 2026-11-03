@@ -669,16 +669,20 @@ void OpDispatchBuilder::FCOMI(OpcodeArgs, IR::OpSize Width, bool Integer, OpDisp
     SetCFDirect(HostFlag_CF);
     SetRFLAG<FEXCore::X86State::RFLAG_ZF_RAW_LOC>(HostFlag_ZF);
 
-    // PF is stored inverted, so invert from the host flag.
-    // TODO: This could perhaps be optimized?
-    auto PF = _Xor(OpSize::i32Bit, HostFlag_Unordered, Constant(1));
-    SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(PF);
-
     // Intel: OF, SF, and AF set to zero
     // AMD:   no mention of OF, SF and AF but actual hardware seems to always zero
     SetRFLAG<FEXCore::X86State::RFLAG_OF_RAW_LOC>(Constant(0));
     SetRFLAG<FEXCore::X86State::RFLAG_SF_RAW_LOC>(Constant(0));
-    SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
+
+    if (APFLG()) {
+      SetAPFLGBits(HostFlag_Unordered, Constant(0));
+    } else {
+      // PF is stored inverted, so invert from the host flag.
+      // TODO: This could perhaps be optimized?
+      auto PF = _Xor(OpSize::i32Bit, HostFlag_Unordered, Constant(1));
+      SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(PF);
+      SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
+    }
   }
 
   // Set Invalid Operation flag when unordered (NaN comparison)
