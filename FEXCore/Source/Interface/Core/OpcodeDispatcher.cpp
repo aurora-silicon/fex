@@ -300,7 +300,7 @@ void OpDispatchBuilder::SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
 }
 
 void OpDispatchBuilder::SALCOp(OpcodeArgs) {
-  CalculateDeferredFlags();
+  CalculateDeferredFlags(true);
 
   auto Result = NZCVSelect(OpSize::i32Bit, CondClass::UGE /* CF = 1 */, _InlineConstant(0xffffffff), _InlineConstant(0));
 
@@ -620,7 +620,7 @@ Ref OpDispatchBuilder::SelectCC0All1(uint8_t OP) {
 }
 
 void OpDispatchBuilder::SETccOp(OpcodeArgs) {
-  CalculateDeferredFlags();
+  CalculateDeferredFlags(true);
 
   Ref SrcCond;
   if (auto Cond = DecodeNZCVCondition(Op->OP & 0xf); Cond) {
@@ -638,7 +638,7 @@ void OpDispatchBuilder::CMOVOp(OpcodeArgs) {
   const auto OP = Op->OP & 0xF;
   const auto ResultSize = std::max(OpSize::i32Bit, OpSizeFromSrc(Op));
 
-  CalculateDeferredFlags();
+  CalculateDeferredFlags(true);
 
   // Destination is always a GPR.
   Ref Dest = LoadSourceGPR_WithOpSize(Op, Op->Dest, GPRSize, Op->Flags);
@@ -1961,8 +1961,25 @@ void OpDispatchBuilder::ADXOp(OpcodeArgs) {
   const bool IsADCX = Op->OP == 0x1F6;
   auto Zero = Constant(0);
 
-  // Before we go trashing NZCV, save the current NZCV state.
-  Ref OldNZCV = GetNZCV();
+  // Before we go trashing NZCV, save the current NZCV state. ADCX/ADOX keep
+  // PF/AF: under APFLG take them from the known values or from NZCV, without
+  // merging pending ones into a copy that would then have to be stored.
+  Ref OldPF {}, OldAF {}, OldPFInv {}, OldNZCV {};
+  if (APFLG()) {
+    OldPF = LazyPF;
+    OldAF = LazyAF;
+    OldPFInv = LazyPFInv;
+    // Only bits 28-31 are needed when PF/AF are known.
+    OldNZCV = CachedNZCV ? CachedNZCV : (OldPF && OldAF) ? _LoadNZCVOnly() : _LoadNZCV();
+    if (!OldPF) {
+      OldPF = _Bfe(OpSize::i32Bit, 1, APFLG_PF_BIT, OldNZCV);
+    }
+    if (!OldAF) {
+      OldAF = _Bfe(OpSize::i32Bit, 1, APFLG_AF_BIT, OldNZCV);
+    }
+  } else {
+    OldNZCV = GetNZCV();
+  }
 
   // We want to use arm64 adc. For ADOX, copy the overflow flag into CF.  For
   // ADCX, we just rectify the carry.
@@ -1989,8 +2006,8 @@ void OpDispatchBuilder::ADXOp(OpcodeArgs) {
     _RmifNZCV(OldNZCV, 28, IsADCX ? 0xd /* NzcV */ : 0xe /* NZCv */);
 
     if (APFLG()) {
-      // RMIF restores NZCV only; put back the PF/AF that ADCS clobbered.
-      SetNZCV(_Bfi(OpSize::i32Bit, 2, APFLG_PF_BIT, GetNZCV(), _Lshr(OpSize::i32Bit, OldNZCV, Constant(APFLG_PF_BIT))));
+      // RMIF restores NZCV only; ADCS clobbered PF/AF, which stay pending.
+      SetAPFLGBits(OldPF, OldAF, OldPFInv);
     }
   } else {
     // For either operation, insert the new flag into the old NZCV.

@@ -28,7 +28,7 @@ constexpr std::array<uint32_t, 17> FlagOffsets = {
 
 void OpDispatchBuilder::ZeroPF_AF() {
   if (APFLG()) {
-    SetNZCV(_Bfi(OpSize::i32Bit, 2, APFLG_PF_BIT, GetNZCV(), Constant(0)));
+    SetAPFLGBits(Constant(0), Constant(0));
     return;
   }
 
@@ -194,6 +194,9 @@ Ref OpDispatchBuilder::LoadPFRaw(bool Mask, bool Invert) {
 
   if (APFLG()) {
     // Bottom bit is PF if Invert, else !PF, as for the raw parity below.
+    if (!Invert && LazyPFInv) {
+      return LazyPFInv;
+    }
     Ref PF = GetAPFLGBit(APFLG_PF_BIT);
     return Invert ? PF : _Xor(OpSize::i32Bit, PF, Constant(1));
   }
@@ -275,6 +278,7 @@ void OpDispatchBuilder::CalculatePFAFFromHost(Ref Res) {
   if (APFLG()) {
     // The flag operation left x86 PF and AF in NZCV.
     PendingAF = {};
+    DropLazyPFAF();
     return;
   }
 
@@ -314,13 +318,17 @@ void OpDispatchBuilder::CalculateAF(Ref Src1, Ref Src2) {
   SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(XorRes);
 }
 
-void OpDispatchBuilder::CalculateDeferredFlags() {
+void OpDispatchBuilder::CalculateDeferredFlags(bool KeepLazyPFAF) {
   if (NZCVDirty && CachedNZCV) {
     _StoreNZCV(CachedNZCV);
   }
 
   CachedNZCV = nullptr;
   NZCVDirty = false;
+
+  if (!KeepLazyPFAF) {
+    StoreLazyPFAF();
+  }
 }
 
 Ref OpDispatchBuilder::IncrementByCarry(OpSize OpSize, Ref Src) {
@@ -424,13 +432,21 @@ Ref OpDispatchBuilder::CalculateFlags_SUB(IR::OpSize SrcSize, Ref Src1, Ref Src2
     // and V are unchanged by that), but the host then computes AF from the
     // negated operand. Under APFLG keep the subtract so AF is x86's.
     Res = APFLG() ? _SubWithFlags(SrcSize, Src1, Src2) : SubWithFlags(SrcSize, Src1, Src2);
+    CalculatePFAFFromHost(Res);
+  } else if (APFLG()) {
+    // 8/16-bit: a 32-bit compare of the operands shifted to the top gives the
+    // narrow NZCV. PF/AF come from a compare of the unshifted operands, which
+    // the dead-flag pass drops when they are not needed.
+    auto Shift = _InlineConstant(32 - IR::OpSizeAsBits(SrcSize));
+    _SubNZCV(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Src1, Shift), _Lshl(OpSize::i32Bit, Src2, Shift));
+    _APFLGFromCompare(Src1, Src2, false);
+    Res = Sub(OpSize::i32Bit, Src1, Src2);
+    CalculatePFAFFromHost(Res);
   } else {
     _SubNZCV(SrcSize, Src1, Src2);
     Res = Sub(OpSize::i32Bit, Src1, Src2);
+    CalculatePF(Res);
   }
-
-  // 8/16-bit AddNZCV/SubNZCV compute x86 PF/AF too under APFLG.
-  CalculatePFAFFromHost(Res);
 
   // If we're updating CF, we need it to be inverted because SubNZCV is inverted
   // from x86. If we're not updating CF, we need to restore the CF since we
@@ -456,13 +472,19 @@ Ref OpDispatchBuilder::CalculateFlags_ADD(IR::OpSize SrcSize, Ref Src1, Ref Src2
   if (SrcSize >= OpSize::i32Bit) {
     // As in CalculateFlags_SUB: the add-to-subtract rewrite changes AF.
     Res = APFLG() ? _AddWithFlags(SrcSize, Src1, Src2) : AddWithFlags(SrcSize, Src1, Src2);
+    CalculatePFAFFromHost(Res);
+  } else if (APFLG()) {
+    // As in CalculateFlags_SUB.
+    auto Shift = _InlineConstant(32 - IR::OpSizeAsBits(SrcSize));
+    _AddNZCV(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Src1, Shift), _Lshl(OpSize::i32Bit, Src2, Shift));
+    _APFLGFromCompare(Src1, Src2, true);
+    Res = Add(OpSize::i32Bit, Src1, Src2);
+    CalculatePFAFFromHost(Res);
   } else {
     _AddNZCV(SrcSize, Src1, Src2);
     Res = Add(OpSize::i32Bit, Src1, Src2);
+    CalculatePF(Res);
   }
-
-  // 8/16-bit AddNZCV/SubNZCV compute x86 PF/AF too under APFLG.
-  CalculatePFAFFromHost(Res);
 
   // We stomped over CF while calculation flags, restore it.
   if (UpdateCF) {

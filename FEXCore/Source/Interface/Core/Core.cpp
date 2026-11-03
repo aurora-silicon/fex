@@ -670,9 +670,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // It is potentially correctness bearing in that sense, but that is a
         // side effect here and (if that behaviour is required) we should handle
         // that more explicitly later.
-        Thread->OpDispatcher->FlushRegisterCache(true);
+        // Pending APFLG PF/AF may stay out of NZCV across an instruction that
+        // cannot fault or leave the block; anything else sees them in NZCV.
+        const bool SideEffects = Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo);
+        Thread->OpDispatcher->FlushRegisterCache(true, false, !SideEffects);
 
-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
+        if (ExtendedDebugInfo || SideEffects) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 

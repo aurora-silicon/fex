@@ -552,10 +552,33 @@ DEF_OP(LoadNZCV) {
   mrs(Dst, ARMEmitter::SystemRegister::NZCV);
 }
 
+DEF_OP(APFLGFromCompare) {
+  auto Op = IROp->C<IR::IROp_APFLGFromCompare>();
+
+  APFLGFixNarrowCompare(Op->IsAdd, GetZeroableReg(Op->Src1), GetReg(Op->Src2));
+}
+
+DEF_OP(LoadNZCVOnly) {
+  mrs(GetReg(Node), ARMEmitter::SystemRegister::NZCV);
+}
+
 DEF_OP(StoreNZCV) {
   auto Op = IROp->C<IR::IROp_StoreNZCV>();
 
   msr(ARMEmitter::SystemRegister::NZCV, GetReg(Op->Value));
+}
+
+DEF_OP(StoreAPFLG) {
+  auto Op = IROp->C<IR::IROp_StoreAPFLG>();
+
+  mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
+  if (Op->Mask & 1) {
+    bfi(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->PF), 26, 1);
+  }
+  if (Op->Mask & 2) {
+    bfi(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->AF), 27, 1);
+  }
+  msr(ARMEmitter::SystemRegister::NZCV, TMP1);
 }
 
 DEF_OP(LoadDF) {

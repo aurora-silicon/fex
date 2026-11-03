@@ -148,6 +148,7 @@ public:
   void StartNewBlock() {
     // If we loaded flags but didn't change them, invalidate the cached copy and move on.
     // Changes get stored out by CalculateDeferredFlags.
+    DropLazyPFAF();
     CachedNZCV = nullptr;
     CFInverted = CFInvertedABI;
 
@@ -1180,7 +1181,8 @@ public:
     _StoreContext(Size, Class, Value, Offset);
   }
 
-  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
+  // KeepLazyPFAF: see CalculateDeferredFlags.
+  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false, bool KeepLazyPFAF = false) {
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
@@ -1192,7 +1194,7 @@ public:
     }
 
     if (!MMXOnly) {
-      CalculateDeferredFlags();
+      CalculateDeferredFlags(KeepLazyPFAF);
     }
 
     const auto GPRSize = GetGPROpSize();
@@ -1687,6 +1689,7 @@ private:
 
   // Set flag tracking to prepare for an operation that directly writes NZCV.
   void HandleNZCVWrite() {
+    DropLazyPFAF();
     CachedNZCV = nullptr;
     NZCVDirty = false;
   }
@@ -1716,15 +1719,33 @@ private:
       CachedNZCV = _LoadNZCV();
     }
 
+    if (LazyPFDirty || LazyAFDirty) {
+      // Whole NZCV wanted: put the pending PF/AF in the cached copy, which is
+      // stored as usual. They stay known for later readers.
+      Ref NZCV = CachedNZCV;
+      if (LazyPFDirty) {
+        NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_PF_BIT, NZCV, LazyPF);
+      }
+      if (LazyAFDirty) {
+        NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_AF_BIT, NZCV, LazyAF);
+      }
+      LazyPFDirty = false;
+      LazyAFDirty = false;
+      CachedNZCV = NZCV;
+      NZCVDirty = true;
+    }
+
     return CachedNZCV;
   }
 
   void SetNZCV(Ref Value) {
+    DropLazyPFAF();
     CachedNZCV = Value;
     NZCVDirty = true;
   }
 
   void ZeroNZCV() {
+    DropLazyPFAF();
     CachedNZCV = Constant(0);
     NZCVDirty = true;
   }
@@ -1738,19 +1759,53 @@ private:
     Ref Src1, Src2;
   } PendingAF {};
 
-  // APFLG: insert 0/1 values of PF and/or AF (nullptr keeps the flag).
-  void SetAPFLGBits(Ref PF, Ref AF) {
-    Ref NZCV = GetNZCV();
+  // APFLG: known 0/1 values of PF/AF, used by readers instead of NZCV. A
+  // dirty one is not in NZCV yet: flushes store it with StoreAPFLG, which the
+  // dead-flag pass drops when a later flag write overwrites it.
+  Ref LazyPF {};
+  Ref LazyAF {};
+  // !LazyPF when the producer has it for free, else nullptr.
+  Ref LazyPFInv {};
+  bool LazyPFDirty {};
+  bool LazyAFDirty {};
+
+  void DropLazyPFAF() {
+    LazyPF = nullptr;
+    LazyAF = nullptr;
+    LazyPFInv = nullptr;
+    LazyPFDirty = false;
+    LazyAFDirty = false;
+  }
+
+  // APFLG: set 0/1 values of PF and/or AF (nullptr keeps the flag).
+  void SetAPFLGBits(Ref PF, Ref AF, Ref PFInv = nullptr) {
     if (PF) {
-      NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_PF_BIT, NZCV, PF);
+      LazyPF = PF;
+      LazyPFInv = PFInv;
+      LazyPFDirty = true;
     }
     if (AF) {
-      NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_AF_BIT, NZCV, AF);
+      LazyAF = AF;
+      LazyAFDirty = true;
     }
-    SetNZCV(NZCV);
+  }
+
+  // Put dirty PF/AF into host NZCV; the host copy of NZCV is current.
+  void StoreLazyPFAF() {
+    if (LazyPFDirty || LazyAFDirty) {
+      _StoreAPFLG(LazyPFDirty ? LazyPF : Invalid(), LazyAFDirty ? LazyAF : Invalid(), (LazyPFDirty ? 1 : 0) | (LazyAFDirty ? 2 : 0));
+      LazyPFDirty = false;
+      LazyAFDirty = false;
+    }
   }
 
   Ref GetAPFLGBit(unsigned Bit) {
+    if (Bit == APFLG_PF_BIT && LazyPF) {
+      return LazyPF;
+    }
+    if (Bit == APFLG_AF_BIT && LazyAF) {
+      return LazyAF;
+    }
     return _Bfe(OpSize::i32Bit, 1, Bit, GetNZCV());
   }
 
@@ -1931,11 +1986,14 @@ private:
   void ZeroPF_AF();
 
   void InvalidateAF() {
+    LazyAF = nullptr;
+    LazyAFDirty = false;
     _InvalidateFlags((1u << X86State::RFLAG_AF_RAW_LOC));
     InvalidateReg(Core::CPUState::AF_AS_GREG);
   }
 
   void InvalidatePF_AF() {
+    DropLazyPFAF();
     _InvalidateFlags((1u << X86State::RFLAG_PF_RAW_LOC) | (1u << X86State::RFLAG_AF_RAW_LOC));
     InvalidateReg(Core::CPUState::PF_AS_GREG);
     InvalidateReg(Core::CPUState::AF_AS_GREG);
@@ -2250,7 +2308,7 @@ private:
       Ref Unordered = GetRFLAG(FEXCore::X86State::RFLAG_OF_RAW_LOC);
       _AXFlag(CTX->HostFeatures.SupportsFlagM2 ? Invalid() : V_inv);
       CFInverted = true;
-      SetAPFLGBits(Unordered, Constant(0));
+      SetAPFLGBits(Unordered, Constant(0), V_inv);
       return;
     }
     SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(V_inv);
@@ -2396,7 +2454,9 @@ private:
   /**
    * @brief Flushes NZCV. Mostly vestigial.
    */
-  void CalculateDeferredFlags();
+  // KeepLazyPFAF: the caller only needs host N/Z/C/V, so pending APFLG PF/AF
+  // may stay out of NZCV.
+  void CalculateDeferredFlags(bool KeepLazyPFAF = false);
 
   void ZeroShiftResult(FEXCore::X86Tables::DecodedOp Op) {
     // In the case of zero-rotate, we need to store the destination still to deal with 32-bit semantics.

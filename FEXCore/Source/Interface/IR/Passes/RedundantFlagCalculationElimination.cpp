@@ -310,7 +310,8 @@ static constexpr FlagInfo ClassifyConst(IROps Op) {
       .CanEliminate = true,
     });
 
-  case OP_LOADNZCV: return FlagInfo::Pack({.Read = FLAG_NZCV});
+  case OP_LOADNZCV:
+  case OP_LOADNZCVONLY: return FlagInfo::Pack({.Read = FLAG_NZCV});
 
   case OP_ADC:
   case OP_ADCZERO:
@@ -337,7 +338,15 @@ static constexpr FlagInfo ClassifyConst(IROps Op) {
   case OP_CONDSUBNZCV:
   case OP_CONDADDNZCV:
   case OP_RMIFNZCV:
+  case OP_STOREAPFLG:
   case OP_INVALIDATEFLAGS: return FlagInfo::Pack({.Special = true});
+
+  case OP_APFLGFROMCOMPARE:
+    // Writes only PF/AF and keeps NZCV, so it goes when they are dead.
+    return FlagInfo::Pack({
+      .Write = FLAG_P | FLAG_A,
+      .CanEliminate = true,
+    });
   default: return FlagInfo::Pack({});
   }
 }
@@ -489,6 +498,15 @@ FlagInfo DeadFlagCalculationEliminination::ClassifySpecial(IROp_Header* IROp) {
     // optimize invalidate-after-write for free.
     return FlagInfo::Pack({
       .Write = Flags,
+      .CanEliminate = true,
+    });
+  }
+
+  case OP_STOREAPFLG: {
+    // Writes only PF/AF and keeps NZCV, so it goes when they are dead.
+    auto Op = IROp->C<IR::IROp_StoreAPFLG>();
+    return FlagInfo::Pack({
+      .Write = ((Op->Mask & 1) ? FLAG_P : 0u) | ((Op->Mask & 2) ? FLAG_A : 0u),
       .CanEliminate = true,
     });
   }
