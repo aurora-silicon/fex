@@ -640,6 +640,19 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
       // the block backwards, that means we handle the write first.
       struct FlagInfo Info = Classify(IROp);
 
+      // APFLG: these keep PF/AF when their condition fails, and PF/AF feed
+      // only their own PF/AF, so they read PF/AF only if those are needed later.
+      if (APFLG && !(FlagsRead & (FLAG_P | FLAG_A)) &&
+          (IROp->Op == OP_CONDADDNZCV || IROp->Op == OP_CONDSUBNZCV || IROp->Op == OP_SHIFTFLAGS)) {
+        Info = FlagInfo::Pack({
+          .Read = Info.Read() & ~(FLAG_P | FLAG_A),
+          .Write = Info.Write(),
+          .CanEliminate = Info.CanEliminate(),
+          .Replacement = Info.Replacement(),
+          .ReplacementNoWrite = Info.ReplacementNoWrite(),
+        });
+      }
+
       if (!Info.Trivial()) {
         bool Eliminated = false;
 
