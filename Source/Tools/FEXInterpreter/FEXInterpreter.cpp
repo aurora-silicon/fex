@@ -441,8 +441,11 @@ int main(int argc, char** argv, char** const envp) {
   // Ensure FEXServer is setup before config options try to pull CONFIG_ROOTFS
   auto SelfPath = FEX::GetSelfPath();
   if (!FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
-    LogMan::Msg::EFmt("FEXServerClient: Failure to setup client");
-    return -1;
+    // Sandboxes (a Flatpak app run through binfmt_misc) can reach neither the host's FEXServer
+    // nor its binary: Flatpak's ldconfig step has no network namespace, host paths or even
+    // /.flatpak-info. The sandbox's runtime is the rootfs there, so carry on without the server
+    // (no rootfs, log forwarding or shared code cache).
+    LogMan::Msg::IFmt("FEXServerClient: no FEXServer, continuing without it");
   }
 
   FEX_CONFIG_OPT(LDPath, ROOTFS);
