@@ -1257,6 +1257,11 @@ void Decoder::BranchTargetInMultiblockRange() {
 
     AddBranchTarget(TargetRIP);
   } else {
+    // Code a conditional branch leaves the multiblock for, often a cold path placed far away, usually jumps back to the instruction
+    // after the branch. Make that an entry point, so the jump back runs this translation rather than translating from there again.
+    if (Conditional) {
+      BlockInfo.EntryPoints.emplace(InstEnd);
+    }
     if (ExternalBranches) {
       ExternalBranches->insert(TargetRIP);
     }
