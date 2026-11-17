@@ -727,6 +727,14 @@
           "Override for a FEXServer socket path. Only useful for chroots."
         ]
       },
+      "DisableIOUring": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "false",
+        "Desc": [
+          "Return ENOSYS for x86-64 io_uring syscalls so affected applications can fall back to poll or epoll."
+        ]
+      },
       "NeedsSeccomp": {
         "Type": "bool",
         "Default": "false",

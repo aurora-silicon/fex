@@ -496,9 +496,15 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
 namespace x64 {
   void RegisterPassthrough(FEX::HLE::SyscallHandler* Handler) {
     RegisterCommon(Handler);
-    REGISTER_SYSCALL_IMPL_X64(io_uring_setup, IOUringSetupRestricted);
-    REGISTER_SYSCALL_IMPL_X64(io_uring_enter, SyscallPassthrough6<SYSCALL_DEF(io_uring_enter)>);
-    REGISTER_SYSCALL_IMPL_X64(io_uring_register, SyscallPassthrough4<SYSCALL_DEF(io_uring_register)>);
+    if (FEXCore::Config::Get_DISABLEIOURING()()) {
+      REGISTER_SYSCALL_IMPL_X64(io_uring_setup, UnimplementedSyscallSafe);
+      REGISTER_SYSCALL_IMPL_X64(io_uring_enter, UnimplementedSyscallSafe);
+      REGISTER_SYSCALL_IMPL_X64(io_uring_register, UnimplementedSyscallSafe);
+    } else {
+      REGISTER_SYSCALL_IMPL_X64(io_uring_setup, IOUringSetupRestricted);
+      REGISTER_SYSCALL_IMPL_X64(io_uring_enter, SyscallPassthrough6<SYSCALL_DEF(io_uring_enter)>);
+      REGISTER_SYSCALL_IMPL_X64(io_uring_register, SyscallPassthrough4<SYSCALL_DEF(io_uring_register)>);
+    }
     REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
     REGISTER_SYSCALL_IMPL_X64(ioctl, SyscallPassthrough3<SYSCALL_DEF(ioctl)>);
     REGISTER_SYSCALL_IMPL_X64(pread_64, SyscallPassthrough4<SYSCALL_DEF(pread_64)>);
