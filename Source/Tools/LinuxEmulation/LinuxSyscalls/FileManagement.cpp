@@ -47,7 +47,9 @@ $end_info$
 namespace FEX::HLE {
 bool FileManager::RootFSPathExists(const char* Filepath) const {
   LOGMAN_THROW_A_FMT(Filepath && Filepath[0] == '/', "Filepath needs to be absolute");
-  return FHU::Filesystem::ExistsAt(RootFSFD, Filepath + 1);
+  // Without a RootFS (e.g. FEX_ROOTFS="" inside pressure-vessel) RootFSFD is AT_FDCWD: look the path up from the
+  // real root, not relative to the working directory.
+  return FHU::Filesystem::ExistsAt(RootFSFD, RootFSFD == AT_FDCWD ? Filepath : Filepath + 1);
 }
 
 void FileManager::LoadThunkDatabase(fextl::unordered_map<fextl::string, ThunkDBObject>& ThunkDB, bool Global) {
