@@ -324,7 +324,24 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(setgid, SyscallPassthrough1<SYSCALL_DEF(setgid)>);
   REGISTER_SYSCALL_IMPL(geteuid, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
   REGISTER_SYSCALL_IMPL(getegid, SyscallPassthrough0<SYSCALL_DEF(getegid)>);
-  REGISTER_SYSCALL_IMPL(setpgid, SyscallPassthrough2<SYSCALL_DEF(setpgid)>);
+  // posix_spawn(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP) does setsid()
+  // then setpgid(0, 0). The kernel returns EPERM because the process is
+  // already a session leader, even when the requested group is already in
+  // effect. glibc then _exit(127) and the parent can hang on a pipe whose
+  // write end is still open in the parent.
+  REGISTER_SYSCALL_IMPL(setpgid, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t pid, uint64_t pgid) -> uint64_t {
+    uint64_t Result = ::syscall(SYSCALL_DEF(setpgid), pid, pgid);
+    if (Result == -1ULL && errno == EPERM) {
+      const pid_t self = ::getpid();
+      const pid_t target = (pid == 0) ? self : static_cast<pid_t>(pid);
+      const pid_t want = (pgid == 0) ? target : static_cast<pid_t>(pgid);
+      if (target == self && ::getpgrp() == want && ::getsid(0) == self) {
+        return 0;
+      }
+      return -EPERM;
+    }
+    SYSCALL_ERRNO();
+  });
   REGISTER_SYSCALL_IMPL(getppid, SyscallPassthrough0<SYSCALL_DEF(getppid)>);
   REGISTER_SYSCALL_IMPL(setsid, SyscallPassthrough0<SYSCALL_DEF(setsid)>);
   REGISTER_SYSCALL_IMPL(setreuid, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
