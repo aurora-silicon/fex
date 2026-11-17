@@ -109,7 +109,8 @@ inline bool IsLibLoaded(const char* libname) {
 // Other than reading the thunk address from `r11`, this is equivalent to the
 // fexfn_pack_* functions generated for global API functions.
 template<auto Thunk, typename Result, typename... Args>
-inline Result CallHostFunction(Args... args) {
+// No stack protector: its prologue loads the canary into r11 (clang) before host_addr is read from it
+__attribute__((no_stack_protector)) inline Result CallHostFunction(Args... args) {
 #ifndef ARCHITECTURE_arm64
 #if __SIZEOF_POINTER__ == 8
   // This magic incantation of using a register variable with an empty asm block is necessary for correct operation!
