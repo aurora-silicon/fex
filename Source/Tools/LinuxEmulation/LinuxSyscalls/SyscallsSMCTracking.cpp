@@ -302,6 +302,13 @@ LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, VMATracking::VMATracki
   return Result;
 }
 
+// The emulated CPU has no protection keys, and on such x86 CPUs Linux makes PROT_EXEC memory readable. Arm64 with EPAN maps
+// PROT_EXEC alone as execute-only, where the frontend could not read the guest code it translates: a decode fault there
+// holds the code invalidation lock into the guest's SIGSEGV handler. So exec implies read on the host, as on that x86.
+static int HostProtection(int prot) {
+  return (prot & PROT_EXEC) ? (prot | PROT_READ) : prot;
+}
+
 void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, void* addr, size_t length, int prot, int flags,
                                 int fd, off_t offset) {
   LOGMAN_THROW_A_FMT(Is64Bit || (length >> 32) == 0, "values must fit to 32 bits");
@@ -321,13 +328,13 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
 
     bool Map32Bit = !Is64Bit || (flags & FEX::HLE::X86_64_MAP_32BIT);
     if (Map32Bit) {
-      Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, prot, flags, fd, offset);
+      Result = (uint64_t)Get32BitAllocator()->Mmap((void*)addr, length, HostProtection(prot), flags, fd, offset);
       if (FEX::HLE::HasSyscallError(Result)) {
         return reinterpret_cast<void*>(Result);
       }
       LOGMAN_THROW_A_FMT(Is64Bit || (Result >> 32) == 0 || (Result >> 32) == 0xFFFFFFFF, "values must fit to 32 bits");
     } else {
-      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
+      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, HostProtection(prot), flags, fd, offset));
       if (Result == ~0ULL) {
         return reinterpret_cast<void*>(-errno);
       }
@@ -473,7 +480,7 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
 
   {
     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
-    Result = ::mprotect(addr, len, prot);
+    Result = ::mprotect(addr, len, HostProtection(prot));
     if (Result == -1) {
       return -errno;
     }
