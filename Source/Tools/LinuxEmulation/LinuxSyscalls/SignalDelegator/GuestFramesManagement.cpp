@@ -129,10 +129,6 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
 
   // If the guest modified the RIP then we need to take special precautions here
   if (Context->OriginalRIP != guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP] || Context->FaultToTopAndGeneratedException) {
-
-    // Restore previous `InSyscallInfo` structure.
-    Frame->InSyscallInfo = Context->InSyscallInfo;
-
     // Hack! Go back to the top of the dispatcher top
     // This is only safe inside the JIT rather than anything outside of it
     ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
@@ -210,9 +206,6 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
   SigFrame_i32* guest_uctx = reinterpret_cast<SigFrame_i32*>(Context->UContextLocation);
   // If the guest modified the RIP then we need to take special precautions here
   if (Context->OriginalRIP != guest_uctx->sc.ip || Context->FaultToTopAndGeneratedException) {
-    // Restore previous `InSyscallInfo` structure.
-    Frame->InSyscallInfo = Context->InSyscallInfo;
-
     // Hack! Go back to the top of the dispatcher top
     // This is only safe inside the JIT rather than anything outside of it
     ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
@@ -288,10 +281,6 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
   RTSigFrame_i32* guest_uctx = reinterpret_cast<RTSigFrame_i32*>(Context->UContextLocation);
   // If the guest modified the RIP then we need to take special precautions here
   if (Context->OriginalRIP != guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP] || Context->FaultToTopAndGeneratedException) {
-
-    // Restore previous `InSyscallInfo` structure.
-    Frame->InSyscallInfo = Context->InSyscallInfo;
-
     // Hack! Go back to the top of the dispatcher top
     // This is only safe inside the JIT rather than anything outside of it
     ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);

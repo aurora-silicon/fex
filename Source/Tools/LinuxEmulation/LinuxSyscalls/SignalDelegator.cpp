@@ -170,7 +170,7 @@ ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::
   Context->FPStateLocation = 0;
   Context->UContextLocation = 0;
   Context->SigInfoLocation = 0;
-  Context->InSyscallInfo = 0;
+  Context->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
 
   // Store fault to top status and then reset it
   Context->FaultToTopAndGeneratedException = Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException;
@@ -260,6 +260,12 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   // Reset the guest state
   memcpy(&Thread->CurrentFrame->State, &Context->GuestState, sizeof(FEXCore::Core::CPUState));
 
+  // Also whether the interrupted code was in a syscall. A guest handler returns through rt_sigreturn, a syscall the JIT
+  // marks with every register spilled and never unmarks, because this restore resumes the interrupted code instead.
+  // Left set, the next signal in the JIT would skip spilling the live registers and build its frame from a stale RSP,
+  // over live stack.
+  Thread->CurrentFrame->InSyscallInfo = Context->InSyscallInfo;
+
   if (Context->UContextLocation) {
     auto Frame = Thread->CurrentFrame;
 
@@ -316,10 +322,6 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     SpillSRA(Thread, ucontext, IgnoreMask);
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
-
-    // We are leaving the syscall information behind. Make sure to store the previous state.
-    ContextBackup->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
-    Thread->CurrentFrame->InSyscallInfo = 0;
   } else {
     if (!IsAddressInDispatcher(OldPC)) {
       // This is likely to cause issues but in some cases it isn't fatal
@@ -332,6 +334,10 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
       }
     }
   }
+
+  // The guest handler isn't in a syscall, even when the signal arrived in the syscall handler. StoreThreadState saved the
+  // interrupted code's value, and the handler's rt_sigreturn restores it.
+  Thread->CurrentFrame->InSyscallInfo = 0;
 
   uint64_t OldGuestSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
   uint64_t NewGuestSP = OldGuestSP;
