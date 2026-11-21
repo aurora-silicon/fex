@@ -147,12 +147,24 @@ namespace x64 {
     ARMEmitter::Reg::r6, ARMEmitter::Reg::r7, ARMEmitter::Reg::r14, ARMEmitter::Reg::r15, ARMEmitter::Reg::r16, ARMEmitter::Reg::r30,
   };
 
+  // When Apple APFLG keeps PF/AF in NZCV, REG_AF (r24, callee-saved) and REG_PF (r9, preserve_all-saved,
+  // only used as EC_CALL_CHECKER_PC_REG on block entry/exit) are free for dynamic RA (+33% GPRs).
+  constexpr std::array<ARMEmitter::Register, 8> RA_APFLG = {
+    ARMEmitter::Reg::r6,  ARMEmitter::Reg::r7, ARMEmitter::Reg::r14, ARMEmitter::Reg::r15,
+    ARMEmitter::Reg::r24, ARMEmitter::Reg::r9, ARMEmitter::Reg::r16, ARMEmitter::Reg::r30,
+  };
+
   constexpr std::array<ARMEmitter::Register, 5> PreserveAll_Dynamic = {ARMEmitter::Reg::r6, ARMEmitter::Reg::r7, ARMEmitter::Reg::r16,
                                                                        ARMEmitter::Reg::r17, ARMEmitter::Reg::r30};
 
   constexpr std::array<ARMEmitter::Register, 7> NotPreserved_Dynamic = {ARMEmitter::Reg::r6,  ARMEmitter::Reg::r7,  ARMEmitter::Reg::r14,
                                                                         ARMEmitter::Reg::r15, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17,
                                                                         ARMEmitter::Reg::r30};
+
+  constexpr std::array<ARMEmitter::Register, 8> NotPreserved_Dynamic_APFLG = {
+    ARMEmitter::Reg::r6,  ARMEmitter::Reg::r7,  ARMEmitter::Reg::r9,  ARMEmitter::Reg::r14,
+    ARMEmitter::Reg::r15, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17, ARMEmitter::Reg::r30,
+  };
 
   constexpr unsigned RAPairs = 4;
 
@@ -387,8 +399,18 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
   // Number of register available is dependent on what operating mode the proccess is in.
   if (EmitterCTX->Config.Is64BitMode()) {
     StaticRegisters = x64::SRA;
+#ifdef ARCHITECTURE_arm64ec
+    if (EmitterCTX->HostFeatures.SupportsAPFLG) {
+      GeneralRegisters = x64::RA_APFLG;
+      GeneralRegistersNotPreserved = x64::NotPreserved_Dynamic_APFLG;
+    } else {
+      GeneralRegisters = x64::RA;
+      GeneralRegistersNotPreserved = x64::NotPreserved_Dynamic;
+    }
+#else
     GeneralRegisters = x64::RA;
     GeneralRegistersNotPreserved = x64::NotPreserved_Dynamic;
+#endif
     StaticFPRegisters = x64::SRAFPR;
     GeneralFPRegisters = x64::RAFPR;
     PairRegisters = x64::RAPairs;
@@ -729,7 +751,12 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
   }
 
   // Now handle PF/AF
-  if (Options.NZCV && PFAFSpillMask) {
+#ifdef ARCHITECTURE_arm64ec
+  const bool ReclaimedPFAF = EmitterCTX->Config.Is64BitMode() && EmitterCTX->HostFeatures.SupportsAPFLG;
+#else
+  const bool ReclaimedPFAF = false;
+#endif
+  if (!ReclaimedPFAF && Options.NZCV && PFAFSpillMask) {
     auto PFOffset = offsetof(FEXCore::Core::CpuStateFrame, State.pf_raw);
     auto AFOffset = offsetof(FEXCore::Core::CpuStateFrame, State.af_raw);
     LOGMAN_THROW_A_FMT(PFAFSpillMask == PFAFMask, "PF/AF not spilled together");
@@ -779,8 +806,15 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
 }
 
 void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
-  auto FindTempReg = [this](uint32_t* GPRFillMask) -> std::optional<ARMEmitter::Register> {
-    for (auto Reg : StaticRegisters) {
+#ifdef ARCHITECTURE_arm64ec
+  const bool ReclaimedPFAF = EmitterCTX->Config.Is64BitMode() && EmitterCTX->HostFeatures.SupportsAPFLG;
+#else
+  const bool ReclaimedPFAF = false;
+#endif
+  auto FindTempReg = [this, ReclaimedPFAF](uint32_t* GPRFillMask) -> std::optional<ARMEmitter::Register> {
+    const size_t Limit = ReclaimedPFAF ? StaticRegisters.size() - 2 : StaticRegisters.size();
+    for (size_t i = 0; i < Limit; ++i) {
+      const auto Reg = StaticRegisters[i];
       if (((1U << Reg.Idx()) & *GPRFillMask)) {
         *GPRFillMask &= ~(1U << Reg.Idx());
         return std::make_optional(Reg);
@@ -882,7 +916,7 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
   }
 
   // Now handle PF/AF
-  if (Options.NZCV && PFAFFillMask) {
+  if (!ReclaimedPFAF && Options.NZCV && PFAFFillMask) {
     LOGMAN_THROW_A_FMT(PFAFFillMask == PFAFMask, "PF/AF not filled together");
 
     ldp<ARMEmitter::IndexType::OFFSET>(REG_PF.W(), REG_AF.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.pf_raw));
