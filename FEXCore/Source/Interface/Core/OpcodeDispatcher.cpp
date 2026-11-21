@@ -3555,14 +3555,16 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
         auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
         auto Src2 = _LoadMemGPR(Size, Dest_RSI, Size);
 
-        // We'll calculate PF/AF after the loop, so use them as temporaries here.
-        StoreRegister(Core::CPUState::PF_AS_GREG, false, Src1);
-        StoreRegister(Core::CPUState::AF_AS_GREG, false, Src2);
+        if (!APFLG()) {
+          // We'll calculate PF/AF after the loop, so use them as temporaries here.
+          StoreRegister(Core::CPUState::PF_AS_GREG, false, Src1);
+          StoreRegister(Core::CPUState::AF_AS_GREG, false, Src2);
+        }
 
         Ref TailCounter = LoadGPRRegister(X86State::REG_RCX);
 
         // Decrement counter
-        TailCounter = SubWithFlags(OpSize::i64Bit, TailCounter, 1);
+        TailCounter = APFLG() ? Sub(OpSize::i64Bit, TailCounter, 1) : SubWithFlags(OpSize::i64Bit, TailCounter, 1);
 
         // Store the counter since we don't have phis
         StoreGPRRegister(X86State::REG_RCX, TailCounter);
@@ -3583,26 +3585,48 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
           StoreGPRRegister(X86State::REG_RSI, Dest_RSI, AddrSize);
         }
 
-        // If TailCounter != 0, compare sources.
-        // If TailCounter == 0, set ZF iff that would break.
-        _CondSubNZCV(OpSize::i64Bit, Src2, Src1, CondClass::NEQ, REPE ? 0 : (1 << 2) /* Z */);
-        CachedNZCV = nullptr;
-        NZCVDirty = false;
-        InnerJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+        if (APFLG()) {
+          // With APFLG, PF/AF registers may be reclaimed for dynamic RA, so compute
+          // full flags in NZCV before branching and branch without clobbering NZCV.
+          CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
+          CalculateDeferredFlags();
 
-        // Jump back to the start if we have more work to do
-        SetTrueJumpTarget(InnerJump, LoopHeader);
+          auto DoneJump = CondJump(TailCounter, CondClass::EQ);
+          auto CheckZF = CreateNewCodeBlockAfter(GetCurrentBlock());
+          SetFalseJumpTarget(DoneJump, CheckZF);
+          SetCurrentCodeBlock(CheckZF);
+          StartNewBlock();
+
+          InnerJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+          SetTrueJumpTarget(InnerJump, LoopHeader);
+
+          auto LoopEnd = CreateNewCodeBlockAfter(GetCurrentBlock());
+          SetTrueJumpTarget(DoneJump, LoopEnd);
+          SetFalseJumpTarget(InnerJump, LoopEnd);
+          SetCurrentCodeBlock(LoopEnd);
+          StartNewBlock();
+        } else {
+          // If TailCounter != 0, compare sources.
+          // If TailCounter == 0, set ZF iff that would break.
+          _CondSubNZCV(OpSize::i64Bit, Src2, Src1, CondClass::NEQ, REPE ? 0 : (1 << 2) /* Z */);
+          CachedNZCV = nullptr;
+          NZCVDirty = false;
+          InnerJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+
+          // Jump back to the start if we have more work to do
+          SetTrueJumpTarget(InnerJump, LoopHeader);
+
+          // Make sure to start a new block after ending this one
+          auto LoopEnd = CreateNewCodeBlockAfter(GetCurrentBlock());
+          SetFalseJumpTarget(InnerJump, LoopEnd);
+          SetCurrentCodeBlock(LoopEnd);
+          StartNewBlock();
+        }
       }
-
-      // Make sure to start a new block after ending this one
-      auto LoopEnd = CreateNewCodeBlockAfter(GetCurrentBlock());
-      SetFalseJumpTarget(InnerJump, LoopEnd);
-      SetCurrentCodeBlock(LoopEnd);
-      StartNewBlock();
     });
 
     // Make sure to start a new block after ending this one
-    {
+    if (!APFLG()) {
       // Grab the sources from the last iteration so we can set flags.
       auto Src1 = LoadGPR(Core::CPUState::PF_AS_GREG);
       auto Src2 = LoadGPR(Core::CPUState::AF_AS_GREG);
