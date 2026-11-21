@@ -80,6 +80,8 @@ private:
 
   // Maps defs to their assigned spill slot + 1, or 0 if not spilled.
   fextl::vector<unsigned> SpillSlots;
+  // Reusable spill slots freed by killed defs or previous blocks.
+  fextl::vector<uint32_t> FreeSpillSlots;
 
   // Next-use distance relative to the block end of each source, last first.
   fextl::vector<uint32_t> SourcesNextUses;
@@ -335,8 +337,13 @@ private:
         SpillSlots.resize(IR->GetSSACount(), 0);
       }
 
-      // TODO: we should colour spill slots
-      uint32_t Slot = IR->GetHeader()->SpillSlots++;
+      uint32_t Slot;
+      if (!FreeSpillSlots.empty()) {
+        Slot = FreeSpillSlots.back();
+        FreeSpillSlots.pop_back();
+      } else {
+        Slot = IR->GetHeader()->SpillSlots++;
+      }
 
       // We must map here in case we're spilling something we shuffled.
       auto SpillOp = IREmit->_SpillRegister(OrderedNodeWrapper::FromImmediate(Reg.Raw), Slot, Reg.AsRegClass());
@@ -563,8 +570,12 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
   Seen.resize(IR->GetSSACount(), false);
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
-    // Spilling is local, so reset this per-block
+    // Spilling is local, so reset this per-block and reuse prior slots.
     AnySpilled = false;
+    FreeSpillSlots.clear();
+    for (uint32_t s = IR->GetHeader()->SpillSlots; s-- > 0;) {
+      FreeSpillSlots.push_back(s);
+    }
 
     // At the start of each block, all registers are available.
     for (auto& Class : Classes) {
@@ -731,6 +742,10 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
           if (Kill) {
             LOGMAN_THROW_A_FMT(IsInRegisterFile(Node), "sources in file");
             FreeReg(Reg);
+            if (!SpillSlots.empty() && SpillSlots[ID] != 0) {
+              FreeSpillSlots.push_back(SpillSlots[ID] - 1);
+              SpillSlots[ID] = 0;
+            }
           }
 
           IROp->Args[s].SetImmediate(Reg.Raw);
@@ -762,6 +777,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
   PreferredReg.clear();
   SSAToReg.clear();
   SpillSlots.clear();
+  FreeSpillSlots.clear();
   NextUses.clear();
   Seen.clear();
 
