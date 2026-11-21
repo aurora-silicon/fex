@@ -271,7 +271,37 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
 }
 
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
+  {
+    std::shared_lock Lock(IntervalsLock);
+    if (XIntervals.Query(Address).Enclosed) {
+      return QueryExecutableRangeLocked(Address);
+    }
+  }
+
+  // Mapping a view of a non-image section raises no protection notification, so an executable view (for example
+  // code written through a second, writable view of the same section) is learnt from its page protection here.
+  // Query under the lock: a protection change notifies under it after changing the pages, so it can't be lost in between.
+  // Writes through another, non-executable view of the section are not seen by SMC detection.
+  std::unique_lock Lock(IntervalsLock);
+  if (XIntervals.Query(Address).Enclosed) {
+    return QueryExecutableRangeLocked(Address);
+  }
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info)) || Info.State != MEM_COMMIT ||
+      Info.Type != MEM_MAPPED || !ProtHasExec(Info.Protect)) {
+    return {};
+  }
+
+  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const FEXCore::IntervalList<uint64_t>::Interval ProtInterval {Base, Base + Info.RegionSize};
+  XIntervals.Insert(ProtInterval);
+  if (ProtIsWritable(Info.Protect)) {
+    RWXIntervals.Insert(ProtInterval);
+  }
+  return QueryExecutableRangeLocked(Address);
+}
+
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
     return {};
