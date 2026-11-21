@@ -40,13 +40,8 @@ void RegisterSignals(FEX::HLE::SyscallHandler* Handler) {
   });
 
   REGISTER_SYSCALL_IMPL(userfaultfd, [](FEXCore::Core::CpuStateFrame* Frame, int flags) -> uint64_t {
-    // Disable userfaultfd until we can properly emulate it
-    // This is okay because the kernel configuration allows you to disable it at compile time
-    return -ENOSYS;
-#if 0
     uint64_t Result = ::syscall(SYSCALL_DEF(userfaultfd), flags);
     SYSCALL_ERRNO();
-#endif
   });
 
   REGISTER_SYSCALL_IMPL(signalfd, [](FEXCore::Core::CpuStateFrame* Frame, int fd, const uint64_t* mask, size_t sigsetsize) -> uint64_t {
