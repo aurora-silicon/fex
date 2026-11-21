@@ -1257,6 +1257,11 @@ void Decoder::BranchTargetInMultiblockRange() {
 
     AddBranchTarget(TargetRIP);
   } else {
+    // Code a conditional branch leaves the multiblock for, often a cold path placed far away, usually jumps back to the instruction
+    // after the branch. Make that an entry point, so the jump back runs this translation rather than translating from there again.
+    if (Conditional) {
+      BlockInfo.EntryPoints.emplace(InstEnd);
+    }
     if (ExternalBranches) {
       ExternalBranches->insert(TargetRIP);
     }
@@ -1600,6 +1605,14 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
       uint64_t RIPToDecode = *BlockDecodeIt;
       BlocksToDecode.erase(BlockDecodeIt);
       VisitedBlocks.emplace(RIPToDecode);
+
+      // Leave code that is already translated as an exit, which block linking turns into a branch to that translation. Decoding it
+      // again would translate it twice: a branch back into a large multiblock would translate everything after it once more.
+      // The code caches need multiblocks that do not depend on what else ran before, so they keep decoding.
+      if (!EntryBlock && !WantsDataMasks && !CTX->RequiresRelocatableConstants() && Thread->LookupCache->FindBlock(Thread, RIPToDecode)) {
+        Paused = false;
+        continue;
+      }
 
       auto BlockSuccIt = std::lower_bound(BlockInfo.Blocks.begin(), BlockInfo.Blocks.end(), RIPToDecode,
                                           [](const auto& a, uint64_t Address) { return a.Entry < Address; });

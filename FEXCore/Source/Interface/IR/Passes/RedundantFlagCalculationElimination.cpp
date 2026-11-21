@@ -858,8 +858,9 @@ void DeadFlagCalculationEliminination::OptimizeParity(IREmitter* IREmit, IRListV
     const auto& Predecessors = CFG.Get(ID)->Predecessors;
     bool Full = false;
 
-    if (Predecessors.empty()) {
-      // Conservatively assume there was full parity before the start block
+    if (Predecessors.empty() || BlockHeader->C<IROp_CodeBlock>()->EntryPoint) {
+      // Conservatively assume there was full parity before the start block, and before any block that can also be entered from
+      // outside the multiblock: its predecessors here don't set PF on that path.
       Full = true;
     } else {
       // If any predecessor needs full parity at the end, we need full parity.
