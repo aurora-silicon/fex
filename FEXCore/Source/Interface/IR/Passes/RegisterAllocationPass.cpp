@@ -16,6 +16,7 @@ $end_info$
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/fextl/vector.h>
+#include <array>
 #include <bit>
 #include <cstdint>
 
@@ -50,6 +51,68 @@ namespace {
     default: return IR::RegClass::Invalid;
     }
   }
+
+  constexpr size_t NumSpillSizeBuckets = 6; // i8, i16, i32, i64, i128, i256
+  constexpr size_t NumSpillPools = 2 * NumSpillSizeBuckets;
+  // Keep small spill frames (<= 256 bytes) zero-aliasing; above that, require
+  // >= 2 queued slots so back-to-back spills do not immediately reuse a slot,
+  // until approaching ARM64 immediate offset limits (64 * 32 = 2048 bytes).
+  constexpr uint32_t MinSpillSlotsBeforeReuse = 8;
+  constexpr uint32_t AggressiveSpillReuseThreshold = 64;
+
+  int GetSpillPool(IR::RegClass Class, IR::OpSize Size) {
+    int ClassIdx = -1;
+    if (Class == IR::RegClass::GPR) {
+      ClassIdx = 0;
+    } else if (Class == IR::RegClass::FPR) {
+      ClassIdx = 1;
+    } else {
+      return -1;
+    }
+
+    int SizeIdx = -1;
+    switch (Size) {
+    case IR::OpSize::i8Bit: SizeIdx = 0; break;
+    case IR::OpSize::i16Bit: SizeIdx = 1; break;
+    case IR::OpSize::i32Bit: SizeIdx = 2; break;
+    case IR::OpSize::i64Bit: SizeIdx = 3; break;
+    case IR::OpSize::i128Bit: SizeIdx = 4; break;
+    case IR::OpSize::i256Bit: SizeIdx = 5; break;
+    default: return -1;
+    }
+    return ClassIdx * NumSpillSizeBuckets + SizeIdx;
+  }
+
+  struct SpillSlotQueue {
+    fextl::vector<uint32_t> Slots;
+    size_t Head {};
+
+    bool Empty() const {
+      return Head >= Slots.size();
+    }
+    size_t Size() const {
+      return Slots.size() - Head;
+    }
+    uint32_t PopFront() {
+      uint32_t Slot = Slots[Head++];
+      if (Head == Slots.size()) {
+        Slots.clear();
+        Head = 0;
+      }
+      return Slot;
+    }
+    void PushBack(uint32_t Slot) {
+      if (Head >= 32 && Head * 2 >= Slots.size()) {
+        Slots.erase(Slots.begin(), Slots.begin() + Head);
+        Head = 0;
+      }
+      Slots.push_back(Slot);
+    }
+    void Clear() {
+      Slots.clear();
+      Head = 0;
+    }
+  };
 } // Anonymous namespace
 
 void RegisterAllocationPass::SetNumPairRegs(uint32_t NumRegs) {
@@ -80,8 +143,14 @@ private:
 
   // Maps defs to their assigned spill slot + 1, or 0 if not spilled.
   fextl::vector<unsigned> SpillSlots;
-  // Reusable spill slots freed by killed defs or previous blocks.
-  fextl::vector<uint32_t> FreeSpillSlots;
+  // Per-(RegClass, OpSize) FIFO freelists of reusable spill slots.
+  std::array<SpillSlotQueue, NumSpillPools> FreeSpillSlots;
+  // Immutable pool index per allocated spill slot, or -1 if unpooled.
+  fextl::vector<int8_t> SpillSlotPool;
+  // Whether each spill slot is currently live in the active block.
+  fextl::vector<bool> SpillSlotInUse;
+  // Spill slots acquired during the current block, for end-of-block release.
+  fextl::vector<uint32_t> ActiveSpillSlots;
 
   // Next-use distance relative to the block end of each source, last first.
   fextl::vector<uint32_t> SourcesNextUses;
@@ -337,16 +406,27 @@ private:
         SpillSlots.resize(IR->GetSSACount(), 0);
       }
 
+      const auto RegClass = Reg.AsRegClass();
+      const int Pool = GetSpillPool(RegClass, Header->Size);
+      const uint32_t TotalSlots = IR->GetHeader()->SpillSlots;
       uint32_t Slot;
-      if (!FreeSpillSlots.empty()) {
-        Slot = FreeSpillSlots.back();
-        FreeSpillSlots.pop_back();
+      if (Pool >= 0 && ((TotalSlots >= AggressiveSpillReuseThreshold && !FreeSpillSlots[Pool].Empty()) ||
+                        (TotalSlots >= MinSpillSlotsBeforeReuse && FreeSpillSlots[Pool].Size() >= 2))) {
+        Slot = FreeSpillSlots[Pool].PopFront();
+        LOGMAN_THROW_A_FMT(!SpillSlotInUse[Slot], "Reused spill slot still in use");
+        SpillSlotInUse[Slot] = true;
       } else {
         Slot = IR->GetHeader()->SpillSlots++;
+        SpillSlotPool.push_back(static_cast<int8_t>(Pool));
+        SpillSlotInUse.push_back(true);
+      }
+
+      if (Pool >= 0) {
+        ActiveSpillSlots.push_back(Slot);
       }
 
       // We must map here in case we're spilling something we shuffled.
-      auto SpillOp = IREmit->_SpillRegister(OrderedNodeWrapper::FromImmediate(Reg.Raw), Slot, Reg.AsRegClass());
+      auto SpillOp = IREmit->_SpillRegister(OrderedNodeWrapper::FromImmediate(Reg.Raw), Slot, RegClass);
       SpillOp.first->Header.Size = Header->Size;
       SpillOp.first->Header.ElementSize = Header->ElementSize;
       SpillSlots[Value] = Slot + 1;
@@ -576,12 +656,8 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
   Seen.resize(IR->GetSSACount(), false);
 
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
-    // Spilling is local, so reset this per-block and reuse prior slots.
+    // Spilling is local, so reset this per-block
     AnySpilled = false;
-    FreeSpillSlots.clear();
-    for (uint32_t s = IR->GetHeader()->SpillSlots; s-- > 0;) {
-      FreeSpillSlots.push_back(s);
-    }
 
     // At the start of each block, all registers are available.
     for (auto& Class : Classes) {
@@ -749,8 +825,13 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
             LOGMAN_THROW_A_FMT(IsInRegisterFile(Node), "sources in file");
             FreeReg(Reg);
             if (!SpillSlots.empty() && SpillSlots[ID] != 0) {
-              FreeSpillSlots.push_back(SpillSlots[ID] - 1);
+              const uint32_t Slot = SpillSlots[ID] - 1;
               SpillSlots[ID] = 0;
+              const int Pool = SpillSlotPool[Slot];
+              if (Pool >= 0 && SpillSlotInUse[Slot]) {
+                SpillSlotInUse[Slot] = false;
+                FreeSpillSlots[Pool].PushBack(Slot);
+              }
             }
           }
 
@@ -779,13 +860,25 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
 
     if (AnySpilled) {
       LOGMAN_THROW_A_FMT(SourceIndex == 0, "Consistent source count in block");
+      for (uint32_t Slot : ActiveSpillSlots) {
+        if (SpillSlotInUse[Slot]) {
+          SpillSlotInUse[Slot] = false;
+          FreeSpillSlots[SpillSlotPool[Slot]].PushBack(Slot);
+        }
+      }
+      ActiveSpillSlots.clear();
     }
   }
 
   PreferredReg.clear();
   SSAToReg.clear();
   SpillSlots.clear();
-  FreeSpillSlots.clear();
+  SpillSlotPool.clear();
+  SpillSlotInUse.clear();
+  ActiveSpillSlots.clear();
+  for (auto& Queue : FreeSpillSlots) {
+    Queue.Clear();
+  }
   NextUses.clear();
   Seen.clear();
 
