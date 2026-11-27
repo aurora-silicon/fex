@@ -647,7 +647,10 @@ private:
   void EmitDivllu(ARMEmitter::Register Quotient, ARMEmitter::Register Remainder, ARMEmitter::Register Upper, ARMEmitter::Register Lower,
                   ARMEmitter::Register Divisor);
 
+  void EmitPendingInterruptFaultCheck();
   void EmitSuspendInterruptCheck();
+
+  [[nodiscard]] bool HasLiveCallerSavedDynamicRegsAfter(IR::Ref Node) const;
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 

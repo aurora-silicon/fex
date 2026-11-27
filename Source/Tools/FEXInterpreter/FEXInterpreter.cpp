@@ -10,6 +10,7 @@ $end_info$
 #include "Common/FEXServerClient.h"
 #include "Common/Config.h"
 #include "Common/HostFeatures.h"
+#include "Common/InheritedFDs.h"
 #include "Common/Linux/LinuxVersion.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "PortabilityInfo.h"
@@ -364,24 +365,6 @@ void Init(bool Is64Bit, FEXCore::Context::Context* CTX) {
 
 } // namespace FEX::Kernel
 
-/**
- * @brief Get an FD from an environment variable and then unset the environment variable.
- *
- * @param Env The environment variable to extract the FD from.
- *
- * @return -1 if the variable didn't exist.
- */
-static int StealFEXFDFromEnv(const char* Env) {
-  int FEXFD {-1};
-  const char* FEXFDStr = getenv(Env);
-  if (FEXFDStr) {
-    const std::string_view FEXFDView {FEXFDStr};
-    std::from_chars(FEXFDView.data(), FEXFDView.data() + FEXFDView.size(), FEXFD, 10);
-    unsetenv(Env);
-  }
-  return FEXFD;
-}
-
 int main(int argc, char** argv, char** const envp) {
   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
   FEXCore::Allocator::GLIBCScopedFault GLIBFaultScope;
@@ -390,14 +373,23 @@ int main(int argc, char** argv, char** const envp) {
   const auto PortableInfo = FEX::ReadPortabilityInformation();
   const bool InterpreterInstalled = QueryInterpreterInstalled(ExecutedWithFD, PortableInfo);
 
-  int FEXFD {StealFEXFDFromEnv("FEX_EXECVEFD")};
-  int FEXSeccompFD {StealFEXFDFromEnv("FEX_SECCOMPFD")};
-  const bool FEXFDPathBacked = getenv("FEX_EXECVEFD_PATH") != nullptr;
-  unsetenv("FEX_EXECVEFD_PATH");
+  // Started with credentials the caller did not have, FEX runs only the program the kernel handed it,
+  // never one the caller names through FEX_EXECVEFD, takes no seccomp filters from FEX_SECCOMPFD, and
+  // reads only the system's configuration.
+  const bool SecureExecution = FEX::Config::IsSecureExecution();
+  const auto Inherited = FEX::TakeInheritedFDs(SecureExecution);
+  int FEXFD {Inherited.ExecveFD};
+  int FEXSeccompFD {Inherited.SeccompFD};
+  const bool FEXFDPathBacked = Inherited.ExecveFDPathBacked;
 
   // Early init trivial handlers.
   LogMan::Throw::InstallHandler(FEX::Logging::AssertHandler);
   LogMan::Msg::InstallHandler(FEX::Logging::MsgHandler);
+
+  if (Inherited.SeccompRefused) {
+    LogMan::Msg::EFmt("FEX_SECCOMPFD is not accepted with elevated credentials, not starting");
+    return 1;
+  }
 
   auto ArgsLoader = fextl::make_unique<FEX::ArgLoader::ArgLoader>(argc, argv);
   auto Args = ArgsLoader->Get();
@@ -410,7 +402,7 @@ int main(int argc, char** argv, char** const envp) {
 
   FEX::Kernel::GCS::CheckForGCS();
 
-  FEX::Config::LoadConfig(Program.ProgramName, envp, PortableInfo);
+  FEX::Config::LoadConfig(Program.ProgramName, envp, PortableInfo, SecureExecution);
 
   // Reload the meta layer
   FEXCore::Config::ReloadMetaLayer();
@@ -437,9 +429,10 @@ int main(int argc, char** argv, char** const envp) {
     }
   }
 
-  // Ensure FEXServer is setup before config options try to pull CONFIG_ROOTFS
+  // Ensure FEXServer is setup before config options try to pull CONFIG_ROOTFS.
+  // With credentials the caller did not have, FEX runs without one and keeps the system config's RootFS.
   auto SelfPath = FEX::GetSelfPath();
-  if (!FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
+  if (!SecureExecution && !FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
     // Sandboxes (a Flatpak app run through binfmt_misc) can reach neither the host's FEXServer
     // nor its binary: Flatpak's ldconfig step has no network namespace, host paths or even
     // /.flatpak-info. The sandbox's runtime is the rootfs there, so carry on without the server

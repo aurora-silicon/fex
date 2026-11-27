@@ -640,4 +640,23 @@ void RegisterTLSData(FEXCore::Core::InternalThreadState* Thread) {
 void UninstallTLSData(FEXCore::Core::InternalThreadState* Thread) {
   Alloc::OSAllocator::TLSThread = nullptr;
 }
+
+ScopedDisableAllocatorDeferredSignals::ScopedDisableAllocatorDeferredSignals()
+  : SavedThread(Alloc::OSAllocator::TLSThread)
+  , Active(true) {
+  Alloc::OSAllocator::TLSThread = nullptr;
+}
+
+ScopedDisableAllocatorDeferredSignals::ScopedDisableAllocatorDeferredSignals(ScopedDisableAllocatorDeferredSignals&& rhs) noexcept
+  : SavedThread(rhs.SavedThread)
+  , Active(rhs.Active) {
+  rhs.SavedThread = nullptr;
+  rhs.Active = false;
+}
+
+ScopedDisableAllocatorDeferredSignals::~ScopedDisableAllocatorDeferredSignals() {
+  if (Active) {
+    Alloc::OSAllocator::TLSThread = SavedThread;
+  }
+}
 } // namespace FEXCore::Allocator

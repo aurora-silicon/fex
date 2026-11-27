@@ -102,7 +102,7 @@ uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
 }
 
 FEXCore::SHMStats::ThreadStats* ThreadManager::StatAlloc::AllocateSlot(uint32_t TID) {
-  std::scoped_lock lk(StatMutex);
+  auto lk = FEXCore::MaskSignalsAndLockMutex(StatMutex);
   return StatAllocBase::AllocateSlot(TID);
 }
 
@@ -111,7 +111,7 @@ void ThreadManager::StatAlloc::DeallocateSlot(FEXCore::SHMStats::ThreadStats* Al
     return;
   }
 
-  std::scoped_lock lk(StatMutex);
+  auto lk = FEXCore::MaskSignalsAndLockMutex(StatMutex);
   StatAllocBase::DeallocateSlot(AllocatedSlot);
 }
 
@@ -251,7 +251,9 @@ ThreadManager::CreateThread(const FEXCore::Core::CPUState* NewThreadState, uint6
 
 void ThreadManager::DestroyThread(FEX::HLE::ThreadStateObject* Thread, bool NeedsTLSUninstall) {
   {
-    std::lock_guard lk(ThreadCreationMutex);
+    // Mask signals on the calling thread rather than using Thread's deferred refcount:
+    // DestroyThread runs after UninstallTLSState on exiting threads and on the parent thread for CLONE_VFORK.
+    auto lk = FEXCore::MaskSignalsAndLockMutex(ThreadCreationMutex);
     auto It = std::find(Threads.begin(), Threads.end(), Thread);
     LOGMAN_THROW_A_FMT(It != Threads.end(), "Thread wasn't in Threads");
     Threads.erase(It);
@@ -488,6 +490,12 @@ void ThreadManager::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThre
 
   auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(LiveThread->CurrentFrame);
   Threads.push_back(ThreadObject);
+
+  // POSIX/Linux: a forked child starts with an empty pending signal set.
+  ThreadObject->SignalInfo.DeferredSignalFrameCount = 0;
+  ThreadObject->SignalInfo.PendingSignals = 0;
+  ThreadObject->SignalInfo.InSigSuspend = false;
+  mprotect(reinterpret_cast<void*>(&LiveThread->InterruptFaultPage), sizeof(LiveThread->InterruptFaultPage), PROT_READ | PROT_WRITE);
 
   // Clean up dead stacks
   FEXCore::Threads::Thread::CleanupAfterFork();

@@ -50,12 +50,31 @@ struct PortableInformation {
 ApplicationNames GetApplicationNames(const fextl::vector<fextl::string>& Args, bool ExecFDInterp, int ProgramFDFromEnv);
 
 /**
+ * @brief Whether this process runs with credentials it was not started with.
+ *
+ * The kernel sets AT_SECURE when an exec changes credentials: a set-user-ID or set-group-ID
+ * program, file capabilities, or a binfmt_misc handler registered with the C flag.
+ */
+bool IsSecureExecution();
+
+/**
  * @brief Loads the FEX and application configurations for the application that is getting ready to run.
  *
  * @param ProgramName Optional program name, if non-empty application specific configurations will be loaded
  * @param envp Optional `envp` passed to main(...)
+ * @param SecureExecution Load only the system's configuration: no user config, app override or FEX_* variable,
+ * and only the system's directories, as the dynamic loader ignores LD_* variables under AT_SECURE.
  */
-void LoadConfig(fextl::string ProgramName = {}, char** const envp = nullptr, const PortableInformation& PortableInfo = {});
+void LoadConfig(fextl::string ProgramName = {}, char** const envp = nullptr, const PortableInformation& PortableInfo = {},
+                bool SecureExecution = IsSecureExecution());
+
+/**
+ * @brief The config files searched for a ThunksDB section, lowest priority first
+ *
+ * @param AppName The application's config name
+ * @param ThunkConfigFile The ThunkConfig option's file
+ */
+fextl::vector<fextl::string> GetThunksDBConfigPaths(const fextl::string& AppName, const fextl::string& ThunkConfigFile);
 
 fextl::string GetHomeDirectory();
 

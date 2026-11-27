@@ -561,6 +561,8 @@ public:
   }
 };
 
+FEX_DEFINE_WINE_APFLG_CPSR_PROBE(ProbeWineAPFLGCPSR, "NtContinue")
+
 void BTCpuProcessInit() {
   FEX::Windows::InitCRTProcess();
   FEX::Windows::SetupThreadHandlers();
@@ -589,9 +591,11 @@ void BTCpuProcessInit() {
     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
   }
 
+  bool SupportsAPFLG = false;
   {
-    auto HostFeatures =
-      FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Wow64, FEX::Windows::UnixLib::GetPID());
+    auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Wow64,
+                                                                     FEX::Windows::UnixLib::GetPID(), ProbeWineAPFLGCPSR);
+    SupportsAPFLG = HostFeatures.SupportsAPFLG;
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   }
 
@@ -608,7 +612,7 @@ void BTCpuProcessInit() {
   auto NtDllX86 = reinterpret_cast<SYSTEM_DLL_INIT_BLOCK*>(GetProcAddress(NtDll, "LdrSystemDllInitBlock"))->ntdll_handle;
   HandleImageMap(NtDllX86);
 
-  CPUFeatures.emplace(*CTX);
+  CPUFeatures.emplace(*CTX, SupportsAPFLG);
 
   // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space
   SIZE_T Size = 4;
@@ -698,6 +702,10 @@ void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {
 }
 
 void BTCpuThreadInit() {
+  if (CPUFeatures) {
+    CPUFeatures->EnableAPFLGForCurrentThread();
+  }
+
   static constexpr size_t DefaultWow64CS {4};
   std::scoped_lock Lock(ThreadCreationMutex);
   FEX::Windows::InitCRTThread();
@@ -927,6 +935,12 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
 }
 
 NTSTATUS BTCpuResetToConsistentState(EXCEPTION_POINTERS* Ptrs) {
+  if (Ptrs &&
+      FEX::Windows::CPUFeatures::HandleAPFLGProbeException(
+        Ptrs->ExceptionRecord, Ptrs->ContextRecord, [](ARM64_NT_CONTEXT* Context, BOOLEAN Alert) { return NtContinue(Context, Alert); })) {
+    return STATUS_SUCCESS;
+  }
+
   if (BTCpuResetToConsistentStateImpl(Ptrs)) {
     NtContinue(Ptrs->ContextRecord, FALSE);
   }
@@ -997,6 +1011,7 @@ void BTCpuNotifyUnmapViewOfSection(void* Address, BOOL After, ULONG Status) {
       HandleImageUnmap(Start, Size);
     }
   } else {
+    InvalidationTracker->EndSectionUnmap();
     ThreadCreationMutex.unlock();
   }
 }

@@ -82,6 +82,10 @@ static void* ThreadHandler(void* Data) {
   Handler->StartRunningResponse.NotifyOne();
 
   CTX->ExecuteThread(Thread->Thread);
+  // Mask all signals before uninstalling TLS and unmapping the signal altstack so an
+  // asynchronous signal cannot enter SignalHandlerThunk and fault in GetThreadFromAltStack.
+  constexpr uint64_t AllSignals = ~0ULL;
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, sizeof(AllSignals));
   FEX::HLE::_SyscallHandler->UninstallTLSState(Thread);
   FEX::HLE::_SyscallHandler->TM.DestroyThread(Thread);
   return nullptr;
@@ -248,6 +252,8 @@ uint64_t HandleNewClone(FEX::HLE::ThreadStateObject* Thread, FEXCore::Context::C
   // Our host clone starts in a new stack space, so it can't return back to the JIT space
   CTX->ExecuteThread(Thread->Thread);
 
+  constexpr uint64_t AllSignals = ~0ULL;
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, sizeof(AllSignals));
   FEX::HLE::_SyscallHandler->UninstallTLSState(Thread);
 
   // The rest of the context remains as is and the thread will continue executing
@@ -461,6 +467,11 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
     }
 
     ThreadObject->StatusCode = status;
+
+    // Mask all signals before uninstalling TLS and unmapping the signal altstack so an
+    // asynchronous signal cannot enter SignalHandlerThunk and fault in GetThreadFromAltStack.
+    constexpr uint64_t AllSignals = ~0ULL;
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, sizeof(AllSignals));
 
     FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
 

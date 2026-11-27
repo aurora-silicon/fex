@@ -155,6 +155,7 @@ public:
   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
   void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
+  uint64_t FlipHostEFLAGS(uint32_t ChangedEFLAGS, uint64_t* HostGPRs, uint64_t PSTATE) override;
 
   void ReconstructXMMRegisters(const FEXCore::Core::InternalThreadState* Thread, __uint128_t* XMM_Low, __uint128_t* YMM_High) override;
   void SetXMMRegistersFromState(FEXCore::Core::InternalThreadState* Thread, const __uint128_t* XMM_Low, const __uint128_t* YMM_High) override;
@@ -224,7 +225,7 @@ public:
 
   void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
-  void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+  bool InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
     return CodeInvalidationMutex;

@@ -45,6 +45,14 @@ namespace VDSOHandlers {
   static GetRandomType GetRandomPtr;
 } // namespace VDSOHandlers
 
+#if defined(ARCHITECTURE_arm64) && defined(__clang__)
+#define FEX_VDSO_NOFP_ATTR __attribute__((target("+nofp,+nosimd")))
+#elif defined(ARCHITECTURE_arm64) && defined(__GNUC__)
+#define FEX_VDSO_NOFP_ATTR __attribute__((target("+nofp+nosimd")))
+#else
+#define FEX_VDSO_NOFP_ATTR
+#endif
+
 using HandlerPtr = void (*)(void*);
 namespace x64 {
   static uint64_t SyscallRet(uint64_t Result) {
@@ -144,8 +152,8 @@ namespace x64 {
   } // namespace glibc
 
   namespace VDSO {
-    // VDSO handlers
-    static void time(void* ArgsRV) {
+    // VDSO handlers (compiled with +nofp,+nosimd on ARM64 so DEF_OP(Thunk) can omit FPR/FPCR spill/fill)
+    FEX_VDSO_NOFP_ATTR static void time(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         time_t* a_0;
         uint64_t rv;
@@ -154,7 +162,7 @@ namespace x64 {
       args->rv = VDSOHandlers::TimePtr(args->a_0);
     }
 
-    static void gettimeofday(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void gettimeofday(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         struct timeval* tv;
         struct timezone* tz;
@@ -164,7 +172,7 @@ namespace x64 {
       args->rv = VDSOHandlers::GetTimeOfDayPtr(args->tv, args->tz);
     }
 
-    static void clock_gettime(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void clock_gettime(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         clockid_t clk_id;
         struct timespec* tp;
@@ -174,7 +182,7 @@ namespace x64 {
       args->rv = VDSOHandlers::ClockGetTimePtr(args->clk_id, args->tp);
     }
 
-    static void clock_getres(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void clock_getres(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         clockid_t clk_id;
         struct timespec* tp;
@@ -317,14 +325,15 @@ namespace x32 {
   } // namespace glibc
 
   namespace VDSO {
-    static bool SyscallErr(uint64_t Result) {
+    FEX_VDSO_NOFP_ATTR static bool SyscallErr(uint64_t Result) {
       return Result >= -4095;
     }
 
-    // VDSO handlers
-    static void time(void* ArgsRV) {
+    // VDSO handlers (compiled with +nofp,+nosimd on ARM64 so DEF_OP(Thunk) can omit FPR/FPCR spill/fill;
+    // use raw uint32_t guest pointers to avoid out-of-line calls to non-nofp compat_ptr helpers).
+    FEX_VDSO_NOFP_ATTR static void time(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
-        HLE::x32::compat_ptr<FEX::HLE::x32::old_time32_t> a_0;
+        uint32_t a_0;
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
@@ -332,14 +341,14 @@ namespace x32 {
       uint64_t Result = VDSOHandlers::TimePtr(&Host);
       args->rv = Result;
       if (!SyscallErr(Result) && args->a_0) {
-        *args->a_0 = Host;
+        *reinterpret_cast<FEX::HLE::x32::old_time32_t*>(static_cast<uintptr_t>(args->a_0)) = Host;
       }
     }
 
-    static void gettimeofday(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void gettimeofday(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
-        HLE::x32::compat_ptr<FEX::HLE::x32::timeval32> tv;
-        HLE::x32::compat_ptr<struct timezone> tz;
+        uint32_t tv;
+        uint32_t tz;
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
@@ -349,18 +358,20 @@ namespace x32 {
         tv_ptr = &tv64;
       }
 
-      uint64_t Result = VDSOHandlers::GetTimeOfDayPtr(tv_ptr, args->tz);
+      uint64_t Result = VDSOHandlers::GetTimeOfDayPtr(tv_ptr, reinterpret_cast<struct timezone*>(static_cast<uintptr_t>(args->tz)));
       args->rv = Result;
 
       if (!SyscallErr(Result) && args->tv) {
-        *args->tv = tv64;
+        auto* GuestTV = reinterpret_cast<FEX::HLE::x32::timeval32*>(static_cast<uintptr_t>(args->tv));
+        GuestTV->tv_sec = tv64.tv_sec;
+        GuestTV->tv_usec = tv64.tv_usec;
       }
     }
 
-    static void clock_gettime(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void clock_gettime(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         clockid_t clk_id;
-        HLE::x32::compat_ptr<HLE::x32::timespec32> tp;
+        uint32_t tp;
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
@@ -369,24 +380,26 @@ namespace x32 {
       args->rv = Result;
 
       if (!SyscallErr(Result) && args->tp) {
-        *args->tp = tp64;
+        auto* GuestTP = reinterpret_cast<HLE::x32::timespec32*>(static_cast<uintptr_t>(args->tp));
+        GuestTP->tv_sec = tp64.tv_sec;
+        GuestTP->tv_nsec = tp64.tv_nsec;
       }
     }
 
-    static void clock_gettime64(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void clock_gettime64(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         clockid_t clk_id;
-        HLE::x32::compat_ptr<struct timespec> tp;
+        uint32_t tp;
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
-      args->rv = VDSOHandlers::ClockGetTimePtr(args->clk_id, args->tp);
+      args->rv = VDSOHandlers::ClockGetTimePtr(args->clk_id, reinterpret_cast<struct timespec*>(static_cast<uintptr_t>(args->tp)));
     }
 
-    static void clock_getres(void* ArgsRV) {
+    FEX_VDSO_NOFP_ATTR static void clock_getres(void* ArgsRV) {
       struct __attribute__((packed)) ArgsRV_t {
         clockid_t clk_id;
-        HLE::x32::compat_ptr<HLE::x32::timespec32> tp;
+        uint32_t tp;
         int rv;
       }* args = reinterpret_cast<ArgsRV_t*>(ArgsRV);
 
@@ -396,7 +409,9 @@ namespace x32 {
       args->rv = Result;
 
       if (!SyscallErr(Result) && args->tp) {
-        *args->tp = tp64;
+        auto* GuestTP = reinterpret_cast<HLE::x32::timespec32*>(static_cast<uintptr_t>(args->tp));
+        GuestTP->tv_sec = tp64.tv_sec;
+        GuestTP->tv_nsec = tp64.tv_nsec;
       }
     }
 
@@ -858,23 +873,52 @@ VDSOMapping LoadVDSOThunks(FEXCore::Core::InternalThreadState* Thread, bool Is64
   // If VDSO couldn't find sigreturn then FEX needs to provide unique implementations.
   LoadFEXGeneratedCode(Thread, Is64Bit, &Mapping, Handler);
 
+  // Linux ARM64 kernel vDSO timekeeping helpers are built with -mgeneral-regs-only,
+  // are non-blocking, and never touch FP/SIMD registers or FPCR. Only enable the NoFP
+  // leaf fast path when the corresponding kernel vDSO symbol was actually resolved
+  // (never for glibc fallbacks, which may use SIMD or PLT lazy resolution).
+#ifdef ARCHITECTURE_arm64
+  const bool TimeIsNoFPLeaf = VDSOHandlers::TimePtr != nullptr;
+  const bool GetTimeOfDayIsNoFPLeaf = VDSOHandlers::GetTimeOfDayPtr != nullptr;
+  const bool ClockGetTimeIsNoFPLeaf = VDSOHandlers::ClockGetTimePtr != nullptr;
+  const bool ClockGetResIsNoFPLeaf = VDSOHandlers::ClockGetResPtr != nullptr;
+#else
+  constexpr bool TimeIsNoFPLeaf = false;
+  constexpr bool GetTimeOfDayIsNoFPLeaf = false;
+  constexpr bool ClockGetTimeIsNoFPLeaf = false;
+  constexpr bool ClockGetResIsNoFPLeaf = false;
+#endif
+
   if (Is64Bit) {
     // Set the Thunk definition pointers for x86-64
     VDSODefinitions[0].ThunkFunction = FEX::VDSO::x64::Handler_time;
+    VDSODefinitions[0].IsNoFPLeaf = TimeIsNoFPLeaf;
     VDSODefinitions[1].ThunkFunction = FEX::VDSO::x64::Handler_gettimeofday;
+    VDSODefinitions[1].IsNoFPLeaf = GetTimeOfDayIsNoFPLeaf;
     VDSODefinitions[2].ThunkFunction = FEX::VDSO::x64::Handler_clock_gettime;
+    VDSODefinitions[2].IsNoFPLeaf = ClockGetTimeIsNoFPLeaf;
     VDSODefinitions[3].ThunkFunction = FEX::VDSO::x64::Handler_clock_gettime;
+    VDSODefinitions[3].IsNoFPLeaf = ClockGetTimeIsNoFPLeaf;
     VDSODefinitions[4].ThunkFunction = FEX::VDSO::x64::Handler_clock_getres;
+    VDSODefinitions[4].IsNoFPLeaf = ClockGetResIsNoFPLeaf;
     VDSODefinitions[5].ThunkFunction = FEX::VDSO::x64::Handler_getcpu;
+    VDSODefinitions[5].IsNoFPLeaf = false;
     VDSODefinitions[6].ThunkFunction = FEX::VDSO::x64::Handler_getrandom;
+    VDSODefinitions[6].IsNoFPLeaf = false;
   } else {
     // Set the Thunk definition pointers for x86
     VDSODefinitions[0].ThunkFunction = FEX::VDSO::x32::Handler_time;
+    VDSODefinitions[0].IsNoFPLeaf = TimeIsNoFPLeaf;
     VDSODefinitions[1].ThunkFunction = FEX::VDSO::x32::Handler_gettimeofday;
+    VDSODefinitions[1].IsNoFPLeaf = GetTimeOfDayIsNoFPLeaf;
     VDSODefinitions[2].ThunkFunction = FEX::VDSO::x32::Handler_clock_gettime;
+    VDSODefinitions[2].IsNoFPLeaf = ClockGetTimeIsNoFPLeaf;
     VDSODefinitions[3].ThunkFunction = FEX::VDSO::x32::Handler_clock_gettime64;
+    VDSODefinitions[3].IsNoFPLeaf = ClockGetTimeIsNoFPLeaf;
     VDSODefinitions[4].ThunkFunction = FEX::VDSO::x32::Handler_clock_getres;
+    VDSODefinitions[4].IsNoFPLeaf = ClockGetResIsNoFPLeaf;
     VDSODefinitions[5].ThunkFunction = FEX::VDSO::x32::Handler_getcpu;
+    VDSODefinitions[5].IsNoFPLeaf = false;
     // getrandom doesn't exist on 32-bit, so leave VDSODefinitions[6] unfilled
   }
 

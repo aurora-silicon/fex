@@ -68,6 +68,12 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
     // Start at maximum instead.
     L1PointerMask = MAX_L1_ENTRIES - 1;
   }
+
+#ifdef ARCHITECTURE_arm64
+  LastPeriodTicks = ReadSampleCounter();
+#else
+  LastPeriod = std::chrono::steady_clock::now();
+#endif
 }
 
 LookupCache::~LookupCache() {

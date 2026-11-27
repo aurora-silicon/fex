@@ -78,6 +78,16 @@ void SetCacheDirectory(const std::string_view Path) {
   Paths[PATH_CACHE_DIR] = Path;
 }
 
+static bool SecureExecution {};
+
+void SetSecureExecution(bool Secure) {
+  SecureExecution = Secure;
+}
+
+bool GetSecureExecution() {
+  return SecureExecution;
+}
+
 const fextl::string& GetTelemetryDirectory() {
   auto& Path = Paths[PATH_CONFIG_TELEMETRY_FOLDER];
   if (Path.empty()) {
@@ -260,6 +270,7 @@ void Initialize() {
 void Shutdown() {
   ConfigLayers.clear();
   Meta = nullptr;
+  SecureExecution = false;
 }
 
 void Load() {
@@ -278,6 +289,12 @@ static fextl::string ExpandPath(const fextl::string& ContainerPrefix, const fext
 
   // Expand home if it exists
   if (FHU::Filesystem::IsRelative(PathName)) {
+    if (SecureExecution) {
+      // The caller chose HOME and the working directory, so neither may pick the file.
+      // The callers look a relative name up under the system's directories instead.
+      return {};
+    }
+
     fextl::string Home = getenv("HOME") ?: "";
     // Home expansion only works if it is the first character
     // This matches bash behaviour
@@ -413,6 +430,28 @@ void ReloadMetaLayer() {
     if (*PathName != "stdout" && *PathName != "stderr" && *PathName != "server") {
       ExpandPathIfExists(FEXCore::Config::CONFIG_OUTPUTLOG, *PathName);
     }
+  }
+
+  if (SecureExecution) {
+    // A relative path left over didn't resolve under the system's directories. Opening it would resolve
+    // it against the caller's working directory, so drop it.
+    for (auto Option : {FEXCore::Config::CONFIG_ROOTFS, FEXCore::Config::CONFIG_THUNKHOSTLIBS, FEXCore::Config::CONFIG_THUNKGUESTLIBS,
+                        FEXCore::Config::CONFIG_THUNKCONFIG, FEXCore::Config::CONFIG_OUTPUTLOG}) {
+      const auto PathName = Meta->Get(Option);
+      if (!PathName || !FHU::Filesystem::IsRelative(**PathName)) {
+        continue;
+      }
+      if (Option == FEXCore::Config::CONFIG_OUTPUTLOG && (**PathName == "stdout" || **PathName == "stderr" || **PathName == "server")) {
+        continue;
+      }
+      FEXCore::Config::Set(Option, "");
+    }
+
+    // The code caches are read from the caller's cache directory and hold host code to run, and telemetry
+    // would be written with the elevated credentials. Use neither.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_ENABLECODECACHINGWIP, "0");
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DISKCACHE, "0");
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLETELEMETRY, "1");
   }
 
   if (FEXCore::Config::Exists(FEXCore::Config::CONFIG_DUMPIR) && !FEXCore::Config::Exists(FEXCore::Config::CONFIG_PASSMANAGERDUMPIR)) {

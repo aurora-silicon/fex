@@ -156,10 +156,17 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
     auto it = Thunks.find(sha256);
 
     if (it != Thunks.end()) {
-      return it->second;
+      return it->second.Fn;
     } else {
       return nullptr;
     }
+  }
+
+  bool IsNoFPLeafThunk(const FEXCore::IR::SHA256Sum& sha256) override {
+    std::shared_lock lk(ThunksMutex);
+
+    auto it = Thunks.find(sha256);
+    return it != Thunks.end() && it->second.IsNoFPLeaf;
   }
 
   void RegisterTLSState(FEX::HLE::ThreadStateObject* _ThreadObject) override {
@@ -168,7 +175,7 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
 
   void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) override {
     for (auto& Definition : Definitions) {
-      Thunks.emplace(Definition.Sum, Definition.ThunkFunction);
+      Thunks.emplace(Definition.Sum, ThunkEntry {Definition.ThunkFunction, Definition.IsNoFPLeaf});
     }
   }
 
@@ -182,27 +189,32 @@ private:
     }
   };
 
-  fextl::unordered_map<FEXCore::IR::SHA256Sum, FEXCore::ThunkedFunction*, TruncatingSHA256Hash> Thunks = {
+  struct ThunkEntry {
+    FEXCore::ThunkedFunction* Fn;
+    bool IsNoFPLeaf {};
+  };
+
+  fextl::unordered_map<FEXCore::IR::SHA256Sum, ThunkEntry, TruncatingSHA256Hash> Thunks = {
     {// sha256(fex:loadlib)
      {0x27, 0x7e, 0xb7, 0x69, 0x5b, 0xe9, 0xab, 0x12, 0x6e, 0xf7, 0x85, 0x9d, 0x4b, 0xc9, 0xa2, 0x44,
       0x46, 0xcf, 0xbd, 0xb5, 0x87, 0x43, 0xef, 0x28, 0xa2, 0x65, 0xba, 0xfc, 0x89, 0x0f, 0x77, 0x80},
-     &ThunkFunctions::LoadLib},
+     {&ThunkFunctions::LoadLib}},
     {// sha256(fex:is_lib_loaded)
      {0xee, 0x57, 0xba, 0x0c, 0x5f, 0x6e, 0xef, 0x2a, 0x8c, 0xb5, 0x19, 0x81, 0xc9, 0x23, 0xe6, 0x51,
       0xae, 0x65, 0x02, 0x8f, 0x2b, 0x5d, 0x59, 0x90, 0x6a, 0x7e, 0xe2, 0xe7, 0x1c, 0x33, 0x8a, 0xff},
-     &ThunkFunctions::IsLibLoaded},
+     {&ThunkFunctions::IsLibLoaded}},
     {// sha256(fex:is_host_heap_allocation)
      {0xf5, 0x77, 0x68, 0x43, 0xbb, 0x6b, 0x28, 0x18, 0x40, 0xb0, 0xdb, 0x8a, 0x66, 0xfb, 0x0e, 0x2d,
       0x98, 0xc2, 0xad, 0xe2, 0x5a, 0x18, 0x5a, 0x37, 0x2e, 0x13, 0xc9, 0xe7, 0xb9, 0x8c, 0xa9, 0x3e},
-     &ThunkFunctions::IsHostHeapAllocation},
+     {&ThunkFunctions::IsHostHeapAllocation}},
     {// sha256(fex:link_address_to_function)
      {0xe6, 0xa8, 0xec, 0x1c, 0x7b, 0x74, 0x35, 0x27, 0xe9, 0x4f, 0x5b, 0x6e, 0x2d, 0xc9, 0xa0, 0x27,
       0xd6, 0x1f, 0x2b, 0x87, 0x8f, 0x2d, 0x35, 0x50, 0xea, 0x16, 0xb8, 0xc4, 0x5e, 0x42, 0xfd, 0x77},
-     &ThunkFunctions::LinkAddressToGuestFunction},
+     {&ThunkFunctions::LinkAddressToGuestFunction}},
     {// sha256(fex:allocate_host_trampoline_for_guest_function)
      {0x9b, 0xb2, 0xf4, 0xb4, 0x83, 0x7d, 0x28, 0x93, 0x40, 0xcb, 0xf4, 0x7a, 0x0b, 0x47, 0x85, 0x87,
       0xf9, 0xbc, 0xb5, 0x27, 0xca, 0xa6, 0x93, 0xa5, 0xc0, 0x73, 0x27, 0x24, 0xae, 0xc8, 0xb8, 0x5a},
-     &ThunkFunctions::AllocateHostTrampolineForGuestFunction},
+     {&ThunkFunctions::AllocateHostTrampolineForGuestFunction}},
   };
 
   FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
@@ -254,7 +266,7 @@ void ThunkHandler_impl::LoadLib(std::string_view Name) {
 
     int i;
     for (i = 0; Exports[i].sha256; i++) {
-      Thunks[*reinterpret_cast<FEXCore::IR::SHA256Sum*>(Exports[i].sha256)] = Exports[i].Fn;
+      Thunks[*reinterpret_cast<FEXCore::IR::SHA256Sum*>(Exports[i].sha256)] = ThunkEntry {Exports[i].Fn, false};
     }
 
     LogMan::Msg::DFmt("Loaded {} syms", i);

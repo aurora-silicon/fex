@@ -20,6 +20,8 @@ namespace FEX::ArchHelpers::Context {
 
 enum ContextFlags : uint32_t {
   CONTEXT_FLAG_INJIT = (1U << 0),
+  CONTEXT_FLAG_INDISPATCHER = (1U << 1),
+  CONTEXT_FLAG_FPR_IN_UCONTEXT = (1U << 2),
 };
 
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
@@ -39,13 +41,15 @@ struct X86ContextBackup {
   uint64_t GPRs[23];
   FEXCore::x86_64::_libc_fpstate FPRState;
   uint64_t sa_mask;
-  uint16_t InSyscallInfo;
+  uint64_t GuestSigMask;
+  uint32_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 
   // Guest state
   int Signal;
   uint32_t Flags;
   uint64_t OriginalRIP;
+  uint32_t OriginalEFLAGS;
   uint64_t FPStateLocation;
   uint64_t UContextLocation;
   uint64_t SigInfoLocation;
@@ -66,13 +70,15 @@ struct ArmContextBackup {
   uint32_t FPCR;
   __uint128_t FPRs[32];
   uint64_t sa_mask;
-  uint16_t InSyscallInfo;
+  uint64_t GuestSigMask;
+  uint32_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 
   // Guest state
   int Signal;
   uint32_t Flags;
   uint64_t OriginalRIP;
+  uint32_t OriginalEFLAGS;
   uint64_t FPStateLocation;
   uint64_t UContextLocation;
   uint64_t SigInfoLocation;
@@ -155,6 +161,10 @@ static inline uint64_t GetArmPState(void* ucontext) {
   return GetMContext(ucontext)->pstate;
 }
 
+static inline void SetArmPState(void* ucontext, uint64_t val) {
+  GetMContext(ucontext)->pstate = val;
+}
+
 static inline uint64_t* GetArmGPRs(void* ucontext) {
   return reinterpret_cast<uint64_t*>(GetMContext(ucontext)->regs);
 }
@@ -177,6 +187,16 @@ static inline __uint128_t* GetArmFPRs(void* ucontext) {
   LOGMAN_THROW_A_FMT(HostState->Head.Magic == FPR_MAGIC, "Wrong FPR Magic: 0x{:08x}", HostState->Head.Magic);
 
   return &HostState->FPRs[0];
+}
+
+static inline void ClearArmAFP(void* ucontext) {
+  auto MContext = GetMContext(ucontext);
+  HostFPRState* HostState = reinterpret_cast<HostFPRState*>(&MContext->__reserved[0]);
+  LOGMAN_THROW_A_FMT(HostState->Head.Magic == FPR_MAGIC, "Wrong FPR Magic: 0x{:08x}", HostState->Head.Magic);
+
+  // Clear FPCR.NEP (bit 2), FPCR.AH (bit 1), and FPCR.FIZ (bit 0) before returning to host C++.
+  constexpr uint32_t AFPBits = (1U << 2) | (1U << 1) | (1U << 0);
+  HostState->FPCR &= ~AFPBits;
 }
 
 static inline uint64_t GetArmESR(void* ucontext) {

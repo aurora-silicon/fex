@@ -47,6 +47,10 @@ public:
     Intervals.clear();
   }
 
+  void Reserve(size_t Capacity) {
+    Intervals.reserve(Capacity);
+  }
+
   bool Empty() const {
     return Intervals.empty();
   }

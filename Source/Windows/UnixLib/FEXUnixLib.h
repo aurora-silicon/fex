@@ -13,6 +13,8 @@ enum class FEXUnixLibFunctions : uint32_t {
   MapFile,
   GetPID,
   CheckSupportsTPIDRRO_CPU,
+  EnableAPFLG,
+  SetAPFLGControl,
   MAX,
 };
 
@@ -22,6 +24,11 @@ struct FEXUnixLib_SetHardwareTSOControlArgs {
   bool Enable;
 };
 static_assert(sizeof(FEXUnixLib_SetHardwareTSOControlArgs) == 1);
+
+struct FEXUnixLib_SetAPFLGControlArgs {
+  bool Enable;
+};
+static_assert(sizeof(FEXUnixLib_SetAPFLGControlArgs) == 1);
 
 // These match the prctl flag values for PR_ARM64_SET_UNALIGN_ATOMIC
 static constexpr uint64_t FEX_UNALIGN_ATOMIC_EMULATE = 1ULL << 0;
@@ -62,10 +69,21 @@ struct FEXUnixLib_MapFile {
 };
 static_assert(sizeof(FEXUnixLib_MapFile) == 24);
 
+static constexpr uint32_t FEX_UNIXLIB_QUERY_MAGIC = 0x46455851U; // "FEXQ"
+
 struct FEXUnixLib_GetPID {
   uint32_t Result;
 };
 static_assert(sizeof(FEXUnixLib_GetPID) == 4);
+
+// Backwards-compatible capability query passed through GetPID: older companion
+// .so libraries only write the 4-byte Result (PID) and leave MaxFunction == 0.
+struct FEXUnixLib_GetPIDQuery {
+  uint32_t Result;
+  uint32_t MaxFunction;
+};
+static_assert(sizeof(FEXUnixLib_GetPIDQuery) == 8);
+static_assert(offsetof(FEXUnixLib_GetPIDQuery, Result) == offsetof(FEXUnixLib_GetPID, Result));
 
 struct FEXUnixLib_CheckSupportsTPIDRRO_CPU {
   uint32_t Result;

@@ -3555,9 +3555,16 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
         auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
         auto Src2 = _LoadMemGPR(Size, Dest_RSI, Size);
 
-        // We'll calculate PF/AF after the loop, so use them as temporaries here.
-        StoreRegister(Core::CPUState::PF_AS_GREG, false, Src1);
-        StoreRegister(Core::CPUState::AF_AS_GREG, false, Src2);
+        if (APFLG()) {
+          // PF/AF registers may be reclaimed for dynamic RA under APFLG, so park
+          // the loop operands in the dedicated CMPS context slots instead.
+          _StoreContextGPR(Size, Src1, offsetof(Core::CPUState, CmpsLoopOperands[0]));
+          _StoreContextGPR(Size, Src2, offsetof(Core::CPUState, CmpsLoopOperands[1]));
+        } else {
+          // We'll calculate PF/AF after the loop, so use them as temporaries here.
+          StoreRegister(Core::CPUState::PF_AS_GREG, false, Src1);
+          StoreRegister(Core::CPUState::AF_AS_GREG, false, Src2);
+        }
 
         Ref TailCounter = LoadGPRRegister(X86State::REG_RCX);
 
@@ -3604,8 +3611,14 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
     // Make sure to start a new block after ending this one
     {
       // Grab the sources from the last iteration so we can set flags.
-      auto Src1 = LoadGPR(Core::CPUState::PF_AS_GREG);
-      auto Src2 = LoadGPR(Core::CPUState::AF_AS_GREG);
+      Ref Src1, Src2;
+      if (APFLG()) {
+        Src1 = _LoadContextGPR(Size, offsetof(Core::CPUState, CmpsLoopOperands[0]));
+        Src2 = _LoadContextGPR(Size, offsetof(Core::CPUState, CmpsLoopOperands[1]));
+      } else {
+        Src1 = LoadGPR(Core::CPUState::PF_AS_GREG);
+        Src2 = LoadGPR(Core::CPUState::AF_AS_GREG);
+      }
       CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
     }
     auto Jump_ = Jump();

@@ -234,12 +234,14 @@ struct DecodedInst {
   const X86InstInfo* TableInfo;
 
   uint32_t Flags;
+  uint32_t InstCRC;
   uint16_t OP;
   uint8_t OPRaw;
 
   uint8_t ModRM;
   uint8_t SIB;
   uint8_t InstSize;
+  uint8_t ValidateSize;
   int8_t REXIndex;
 };
 

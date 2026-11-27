@@ -22,7 +22,8 @@ static inline std::optional<fextl::string> GetSelfPath() {
 }
 
 static inline FEX::Config::PortableInformation ReadPortabilityInformation() {
-  const char* PortableConfig = getenv("FEX_PORTABLE");
+  // A portable install is the caller's choice, so it isn't used with credentials the caller did not have.
+  const char* PortableConfig = FEX::Config::IsSecureExecution() ? nullptr : getenv("FEX_PORTABLE");
   if (!PortableConfig) {
     return {false, {}};
   }

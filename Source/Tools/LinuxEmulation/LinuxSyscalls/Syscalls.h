@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/CompilerDefs.h>
+#include <FEXCore/Utils/IntervalList.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/functional.h>
@@ -31,6 +32,7 @@ $end_info$
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <array>
 #include <mutex>
 #include <shared_mutex>
 
@@ -92,6 +94,8 @@ void RegisterStubs(FEX::HLE::SyscallHandler* Handler);
 
 uint64_t UnimplementedSyscall(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
 uint64_t UnimplementedSyscallSafe(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
+// ioctl on a userfaultfd (request type UFFDIO), for both guest ABIs.
+uint64_t UserfaultfdIoctl(int fd, uint32_t cmd, uint64_t arg);
 
 struct ExecveAtArgs {
   int dirfd;
@@ -288,6 +292,10 @@ public:
   ///// VMA (Virtual Memory Area) tracking /////
   static bool HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+  // MarkGuestExecutableRange protects the writable views of shared memory that exist when code is compiled. A view mapped or made
+  // writable later (the RW half of a W^X double mapping, as .NET uses) must be protected where it aliases an executable view too,
+  // or writes through it never reach the code invalidation. Call with VMATracking.Mutex held, after tracking the change.
+  void ProtectNewWritableAliases(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length);
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   std::optional<FEXCore::ExecutableFileSectionInfo>
   LookupExecutableFileSection(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) final override;
@@ -361,6 +369,33 @@ private:
   std::mutex SyscallMutex;
   // std::mutex CodeCachePatchingMutex;
   FEXCore::ForkableUniqueMutex CodeCachePatchingMutex;
+
+  // Adaptive inline SMC promotion state for hot RWX code+data pages.
+  // InlineSMCMutex is a strict leaf lock (never held while acquiring any other mutex).
+  // PageSMCFaultTable is a fixed-size inline 4-way set-associative table so HandleSegfault never
+  // allocates when tracking per-page faults. InlineSMCIntervals is pre-reserved at startup for
+  // up to 256 promoted pages (1 MiB) before reallocating; any reallocation past that is
+  // protected by ScopedDisableAllocatorDeferredSignals (Layer 1).
+  static constexpr uint8_t INLINE_SMC_PROMOTION_THRESHOLD = 4;
+  static constexpr size_t INLINE_SMC_INITIAL_INTERVAL_CAPACITY = 256;
+  static constexpr size_t INLINE_SMC_FAULT_TABLE_SETS = 128;
+  static constexpr size_t INLINE_SMC_FAULT_TABLE_WAYS = 4;
+  static constexpr size_t INLINE_SMC_FAULT_TABLE_ENTRIES = INLINE_SMC_FAULT_TABLE_SETS * INLINE_SMC_FAULT_TABLE_WAYS;
+  struct PageSMCFaultEntry {
+    uint64_t PageBase {};
+    uint64_t WindowStartTicks {};
+    uint8_t Count {};
+  };
+  mutable FEXCore::ForkableSharedMutex InlineSMCMutex;
+  FEXCore::IntervalList<uint64_t> InlineSMCIntervals;
+  std::array<PageSMCFaultEntry, INLINE_SMC_FAULT_TABLE_ENTRIES> PageSMCFaultTable {};
+  uint32_t ActiveSMCFaultEntries {};
+
+  bool RecordSMCFaultLocked(uint64_t PageBase, uint64_t NowTicks, uint64_t WindowTicks);
+  void EraseSMCFaultPageLocked(uint64_t PageBase);
+  FEXCore::HLE::ExecutableRangeInfo ClipToInlineSMCIntervalsLocked(uint64_t Address, FEXCore::HLE::ExecutableRangeInfo Range) const;
+  void ProtectNonInlineRangeLocked(uintptr_t ExecBase, uintptr_t ProtBase, uintptr_t Size) const;
+  void ClearInlineSMCState(uintptr_t Base, uintptr_t Size);
 
   FEX::CodeLoader* LocalLoader {};
   bool NeedToCheckXID {true};

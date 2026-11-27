@@ -103,6 +103,18 @@ public:
   ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) = 0;
   ///< Sets FEX's internal EFLAGS representation to the passed in compacted form.
   FEX_DEFAULT_VISIBILITY virtual void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) = 0;
+  /**
+   * @brief Flips the flags in ChangedEFLAGS where the JIT keeps them in host state: NZCV in PSTATE, PF and AF in host GPRs.
+   *
+   * Flipping rather than setting works however the JIT holds a flag at the interrupted point, such as CF inverted or not.
+   *
+   * @param ChangedEFLAGS Compacted EFLAGS bits to flip. Only CF, PF, AF, ZF, SF and OF are used.
+   * @param HostGPRs The host Arm64 GPRs at the point of state inside the JIT.
+   * @param PSTATE The Arm64 PState value.
+   *
+   * @return PSTATE with the flags flipped
+   */
+  FEX_DEFAULT_VISIBILITY virtual uint64_t FlipHostEFLAGS(uint32_t ChangedEFLAGS, uint64_t* HostGPRs, uint64_t PSTATE) = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void
   ReconstructXMMRegisters(const FEXCore::Core::InternalThreadState* Thread, __uint128_t* XMM_Low, __uint128_t* YMM_High) = 0;
@@ -140,7 +152,7 @@ public:
   virtual void FlushAndCloseCodeMap() = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
-  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+  FEX_DEFAULT_VISIBILITY virtual bool InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;

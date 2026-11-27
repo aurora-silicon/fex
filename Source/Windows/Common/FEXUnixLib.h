@@ -56,4 +56,12 @@ uint32_t GetPID();
 // Returns true if the system supports CPU Index in TPIDRRO
 bool SupportsTPIDRRO_CPU();
 
+// Probes HWCAP3_APPLE_APFLG and enables PR_AURORA_SET_X86_FLAGS on the current thread
+// if supported by the loaded companion Unix library.
+bool TryEnableAPFLG();
+
+// Disables PR_AURORA_SET_X86_FLAGS on the current thread if supported by the loaded
+// companion Unix library.
+bool DisableAPFLG();
+
 } // namespace FEX::Windows::UnixLib

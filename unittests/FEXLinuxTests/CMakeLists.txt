@@ -71,6 +71,11 @@ function(AddTests Tests BinDirectory Bitness)
       set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_HOSTFEATURES=disablerng;FEX_SOFTWARERNG=1")
     endif()
 
+    if(TEST_NAME STREQUAL "diskcache-gap")
+      # The test needs blocks stored in the disk cache
+      set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_DISKCACHE=1")
+    endif()
+
     if(TEST_NAME STREQUAL "call_padding")
       # The test reads FEX's compile count
       set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_PROFILESTATS=1")

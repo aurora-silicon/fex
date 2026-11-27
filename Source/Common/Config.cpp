@@ -21,6 +21,8 @@
 #ifndef _WIN32
 #include <linux/limits.h>
 #include <pwd.h>
+#include <sys/auxv.h>
+#include <unistd.h>
 #endif
 #include <optional>
 #include <utility>
@@ -484,10 +486,36 @@ ApplicationNames GetApplicationNames(const fextl::vector<fextl::string>& Args, b
   return ApplicationNames {std::move(Program), std::move(ProgramName)};
 }
 
-void LoadConfig(fextl::string ProgramName, char** const envp, const PortableInformation& PortableInfo) {
+bool IsSecureExecution() {
+#ifndef _WIN32
+  return getauxval(AT_SECURE) != 0 || getuid() != geteuid() || getgid() != getegid();
+#else
+  return false;
+#endif
+}
+
+void LoadConfig(fextl::string ProgramName, char** const envp, const PortableInformation& PortableInfo, bool SecureExecution) {
   const bool IsPortable = PortableInfo.IsPortable;
   FEX::Config::InitializeConfigs(PortableInfo);
   FEXCore::Config::Initialize();
+  FEXCore::Config::SetSecureExecution(SecureExecution);
+  if (SecureExecution) {
+    // Credentials the caller did not have: only the system's configuration and directories. A user's
+    // configs, the environment's directories and FEX_* variables would otherwise choose the RootFS and
+    // libraries that run with them. A portable install is the caller's choice too, so it is ignored.
+    for (bool Global : {false, true}) {
+      FEXCore::Config::SetDataDirectory(GLOBAL_DATA_DIRECTORY, Global);
+      FEXCore::Config::SetConfigDirectory(GLOBAL_DATA_DIRECTORY, Global);
+      FEXCore::Config::SetConfigFileLocation(GLOBAL_DATA_DIRECTORY "Config.json", Global);
+    }
+    FEXCore::Config::AddLayer(CreateGlobalMainLayer());
+    if (!ProgramName.empty()) {
+      FEXCore::Config::AddLayer(CreateAppLayer(ProgramName, FEXCore::Config::LayerType::LAYER_GLOBAL_APP));
+    }
+    FEXCore::Config::Load();
+    return;
+  }
+
   if (!IsPortable) {
     FEXCore::Config::AddLayer(CreateGlobalMainLayer());
   }
@@ -525,6 +553,48 @@ void LoadConfig(fextl::string ProgramName, char** const envp, const PortableInfo
 
   FEXCore::Config::AddLayer(CreateEnvironmentLayer(envp));
   FEXCore::Config::Load();
+}
+
+fextl::vector<fextl::string> GetThunksDBConfigPaths(const fextl::string& AppName, const fextl::string& ThunkConfigFile) {
+  if (FEXCore::Config::GetSecureExecution()) {
+    // With credentials the caller did not have, only the system's configs: neither SteamAppId nor
+    // FEX_APP_CONFIG chooses one. The local configs are the same files here, and a local app config
+    // falls back to the working directory when its directory can't be created.
+    return {
+      FEXCore::Config::GetConfigFileLocation(true),
+      ThunkConfigFile,
+      FEXCore::Config::GetApplicationConfig(AppName, true),
+    };
+  }
+
+  fextl::vector<fextl::string> ConfigPaths {
+    FEXCore::Config::GetConfigFileLocation(true),
+    FEXCore::Config::GetConfigFileLocation(false),
+    ThunkConfigFile,
+  };
+
+  auto SteamID = getenv("SteamAppId");
+  if (SteamID) {
+    // If a SteamID exists then let's search for Steam application configs as well.
+    // We want to key off both the SteamAppId number /and/ the executable since we may not want to thunk all binaries.
+    fextl::string SteamAppName = fextl::fmt::format("Steam_{}_{}", SteamID, AppName);
+
+    // Steam application configs interleaved with non-steam for priority sorting.
+    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(SteamAppName, true));
+    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, true));
+    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(SteamAppName, false));
+    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, false));
+  } else {
+    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, true));
+    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, false));
+  }
+
+  const char* AppConfig = getenv("FEX_APP_CONFIG");
+  if (AppConfig) {
+    ConfigPaths.emplace_back(AppConfig);
+  }
+
+  return ConfigPaths;
 }
 
 #ifndef _WIN32

@@ -37,6 +37,19 @@ DEF_OP(CallbackReturn) {
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::r2, 8);
   str(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.gregs[X86State::REG_RSP]));
 
+  // Restore the enclosing thunk's InSyscallInfo saved by CallbackPtr before returning to the host thunk.
+  ldp<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::x2, ARMEmitter::XReg::x3, ARMEmitter::Reg::rsp, 16);
+  str(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // Flush any async signal deferred during the callback or CallbackReturn before returning into
+    // a potentially blocking host thunk. Only check when InSyscallInfo is non-zero so HandleDispatcherGuestSignal
+    // keeps the frame copy instead of spilling over the already-adjusted guest RSP.
+    ARMEmitter::ForwardLabel SkipPendingCheck;
+    cbz_OrRestart(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, &SkipPendingCheck);
+    EmitPendingInterruptFaultCheck();
+    BindOrRestart(&SkipPendingCheck);
+  }
+
   PopCalleeSavedRegisters();
 
   // Return to the thunk
@@ -205,9 +218,10 @@ DEF_OP(ExitFunction) {
     // L1 Cache
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address
     // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    eor(ARMEmitter::Size::i64Bit, TMP3, RipReg, RipReg, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
     add(TMP1, TMP1, TMP2);
 
     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
@@ -293,18 +307,112 @@ DEF_OP(Syscall) {
   br(TMP1);
 }
 
+bool Arm64JITCore::HasLiveCallerSavedDynamicRegsAfter(IR::Ref Node) const {
+  if (!IR->PostRA()) {
+    return true;
+  }
+
+  uint32_t NonPreservedGPRMask = 0;
+  for (size_t i = 0; i < GeneralRegisters.size(); ++i) {
+    for (const auto& NotPreserved : GeneralRegistersNotPreserved) {
+      if (GeneralRegisters[i] == NotPreserved) {
+        NonPreservedGPRMask |= (1U << i);
+        break;
+      }
+    }
+  }
+
+  uint32_t DefinedDynGPR = 0;
+  uint32_t DefinedDynFPR = 0;
+
+  auto It = IR->at(IR->WrapNode(Node));
+  const auto End = IR->end();
+  if (It != End) {
+    ++It;
+  }
+
+  for (; It != End; ++It) {
+    auto [AfterNode, AfterOp] = It();
+    if (AfterOp->Op == IR::OP_GUESTOPCODE || AfterOp->Op == IR::OP_INLINECONSTANT || AfterOp->Op == IR::OP_INLINEENTRYPOINTOFFSET) {
+      continue;
+    }
+
+    const int NumArgs = IR::GetRAArgs(AfterOp->Op);
+    for (int s = 0; s < NumArgs; ++s) {
+      const auto Arg = AfterOp->Args[s];
+      if (!Arg.IsImmediate()) {
+        continue;
+      }
+      const IR::PhysicalRegister Reg(Arg);
+      const auto Class = Reg.AsRegClass();
+      if (Class == IR::RegClass::GPR) {
+        const uint32_t Bit = 1U << Reg.Reg;
+        if ((NonPreservedGPRMask & Bit) != 0 && (DefinedDynGPR & Bit) == 0) {
+          return true;
+        }
+      } else if (Class == IR::RegClass::FPR) {
+        const uint32_t Bit = 1U << Reg.Reg;
+        if ((DefinedDynFPR & Bit) == 0) {
+          return true;
+        }
+      }
+    }
+
+    if (IR::GetHasDest(AfterOp->Op)) {
+      const IR::PhysicalRegister Dst(AfterNode);
+      const auto Class = Dst.AsRegClass();
+      if (Class == IR::RegClass::GPR) {
+        DefinedDynGPR |= (1U << Dst.Reg);
+      } else if (Class == IR::RegClass::FPR) {
+        DefinedDynFPR |= (1U << Dst.Reg);
+      }
+    }
+  }
+
+  return false;
+}
+
 DEF_OP(Thunk) {
   auto Op = IROp->C<IR::IROp_Thunk>();
   // Arguments are passed as follows:
-  // X0: CTX
-  // X1: Args (from guest stack)
+  // X0: Args (from guest stack)
+  //
+  // Check whether any caller-saved dynamic registers are live across OP_THUNK in this block.
+  // ThunkOp flushes the register cache and immediately pops NewRIP + ExitFunction, so in the
+  // common case zero dynamic registers are live and we skip PushDynamicRegs/PopDynamicRegs.
+  const bool NeedPushDynamicRegs = HasLiveCallerSavedDynamicRegsAfter(Node);
+
+  // Non-blocking NoFP leaf thunks (e.g., Linux ARM64 kernel vDSO timekeeping helpers) never
+  // execute FP/SIMD instructions or touch FPCR, so we can skip spilling/filling static FPRs
+  // and serializing FPCR updates while marking SRA_FPR_UNSPILLED for signal reconstruction.
+  // Disable when SVE is active (a kernel vDSO svc #0 fallback discards SVE predicate and
+  // upper Z state) or when generating/writing/validating a persistent code/disk cache
+  // (where a later process may not resolve the kernel vDSO symbol and fall back to glibc).
+  const bool IsNoFPLeaf = !CTX->HostFeatures.SupportsSVE() && !CTX->RequiresRelocatableConstants() && !CTX->DiskCache.IsValidating() &&
+                          CTX->ThunkHandler && CTX->ThunkHandler->IsNoFPLeafThunk(Op->ThunkNameHash);
 
   // spill to ctx before ra64 spill
   SpillStaticRegs(TMP1, {
+                          .FPRs = !IsNoFPLeaf,
                           .NZCV = false,
+                          .FPCR = !IsNoFPLeaf,
                         });
 
-  PushDynamicRegs(TMP1);
+  if (NeedPushDynamicRegs) {
+    PushDynamicRegs(TMP1);
+  }
+
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // Mark the thread as in a thunk call so SignalDelegator does not clobber spilled static GPRs
+    // with host registers, and (for NoFP leaf thunks) knows static FPRs live in ucontext.
+    // Non-leaf thunks may block, so flush pending deferred signals before the call.
+    const uint64_t ThunkFlags = FEXCore::Core::CpuStateFrame::IN_THUNK_CALL | (IsNoFPLeaf ? FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED : 0);
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, ThunkFlags);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    if (!IsNoFPLeaf) {
+      EmitPendingInterruptFaultCheck();
+    }
+  }
 
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, GetReg(Op->ArgPtr));
 
@@ -315,12 +423,33 @@ DEF_OP(Thunk) {
     blr(ARMEmitter::Reg::r2);
   }
 
-  PopDynamicRegs();
+  if (NeedPushDynamicRegs) {
+    PopDynamicRegs();
+  }
+
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // Defer async signals across FillStaticRegs and clearing IN_THUNK_CALL so a signal cannot arrive
+    // after static registers are partially or fully filled while IN_THUNK_CALL is still set (which
+    // suppresses FillSRA on sigreturn).
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+    add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+  }
 
   // load from ctx after ra64 refill
   FillStaticRegs({
+    .FPRs = !IsNoFPLeaf,
     .NZCV = false,
+    .FPCR = !IsNoFPLeaf,
   });
+
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+    EmitPendingInterruptFaultCheck();
+  }
 }
 
 DEF_OP(ValidateCode) {
@@ -365,7 +494,7 @@ DEF_OP(ValidateCode) {
     WorkingReg = TMP1;
   }
 
-  sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
+  sub(ARMEmitter::Size::i32Bit, Dst, WorkingReg, CRC32Reg);
 
   ARMEmitter::ForwardLabel End;
   cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &End);

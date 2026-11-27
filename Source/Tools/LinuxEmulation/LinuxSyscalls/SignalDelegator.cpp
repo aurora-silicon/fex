@@ -20,9 +20,11 @@ $end_info$
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/FPState.h>
 #include <FEXCore/Utils/Profiler.h>
+#include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -64,12 +66,6 @@ static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   ThreadObject->SignalInfo.Delegator->HandleSignal(ThreadObject, Signal, Info, UContext);
 }
 
-static uint64_t SigIsMember(GuestSAMask* Set, int Signal) {
-  // Signal 0 isn't real, so everything is offset by one inside the set
-  Signal -= 1;
-  return (Set->Val >> Signal) & 1;
-}
-
 /**
  * @name Signal frame setup
  * @{ */
@@ -103,19 +99,8 @@ void SignalDelegator::RegisterHostSignalHandler(int Signal, HostSignalDelegatorF
   FrontendRegisterHostSignalHandler(Signal, Required);
 }
 
-void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask) {
+void SignalDelegator::SpillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext) {
 #ifdef ARCHITECTURE_arm64
-  Thread->CurrentFrame->State.rip = CTX->RestoreRIPFromHostPC(Thread, ArchHelpers::Context::GetPc(ucontext));
-
-  for (size_t i = 0; i < Config.SRAGPRCount; i++) {
-    const uint8_t SRAIdxMap = Config.SRAGPRMapping[i];
-    if (IgnoreMask & (1U << SRAIdxMap)) {
-      // Skip this one, it's already spilled
-      continue;
-    }
-    Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmReg(ucontext, SRAIdxMap);
-  }
-
   if (SupportsAVX && SupportsSVE256) {
     // TODO: This doesn't save the upper 128-bits of the 256-bit registers.
     // This needs to be implemented still.
@@ -129,6 +114,38 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
       memcpy(&Thread->CurrentFrame->State.xmm.sse.data[i][0], &FPR, sizeof(__uint128_t));
     }
   }
+#endif
+}
+
+void SignalDelegator::FillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext) {
+#ifdef ARCHITECTURE_arm64
+  const auto& State = Thread->CurrentFrame->State;
+  // A 32-bit guest frame only has the first eight registers, the frame's copy of the rest predates the spill.
+  const size_t GuestRegs = Is64BitMode ? 16 : 8;
+
+  // Like SpillSRAFPRs, this leaves the upper 128-bits of 256-bit registers alone.
+  auto* FPRs = ArchHelpers::Context::GetArmFPRs(ucontext);
+  for (size_t i = 0; i < std::min<size_t>(Config.SRAFPRCount, GuestRegs); i++) {
+    const void* XMM = SupportsAVX && SupportsSVE256 ? &State.xmm.avx.data[i][0] : &State.xmm.sse.data[i][0];
+    memcpy(&FPRs[Config.SRAFPRMapping[i]], XMM, sizeof(__uint128_t));
+  }
+#endif
+}
+
+void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask) {
+#ifdef ARCHITECTURE_arm64
+  Thread->CurrentFrame->State.rip = CTX->RestoreRIPFromHostPC(Thread, ArchHelpers::Context::GetPc(ucontext));
+
+  for (size_t i = 0; i < Config.SRAGPRCount; i++) {
+    const uint8_t SRAIdxMap = Config.SRAGPRMapping[i];
+    if (IgnoreMask & (1U << SRAIdxMap)) {
+      // Skip this one, it's already spilled
+      continue;
+    }
+    Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmReg(ucontext, SRAIdxMap);
+  }
+
+  SpillSRAFPRs(Thread, ucontext);
 
   uint32_t EFlags =
     CTX->ReconstructCompactedEFLAGS(Thread, true, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext));
@@ -136,7 +153,31 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
 #endif
 }
 
-ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext) {
+// The inverse of SpillSRA, for resuming the interrupted JIT code with the guest state in the frame.
+void SignalDelegator::FillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask, uint32_t ChangedEFLAGS) {
+#ifdef ARCHITECTURE_arm64
+  const auto& State = Thread->CurrentFrame->State;
+  // A 32-bit guest frame only has the first eight registers, the frame's copy of the rest predates the spill.
+  const size_t GuestRegs = Is64BitMode ? 16 : 8;
+
+  for (size_t i = 0; i < std::min<size_t>(Config.SRAGPRCount, GuestRegs); i++) {
+    const uint8_t SRAIdxMap = Config.SRAGPRMapping[i];
+    if (IgnoreMask & (1U << SRAIdxMap)) {
+      // Already spilled, the JIT reloads it from the frame
+      continue;
+    }
+    ArchHelpers::Context::SetArmReg(ucontext, SRAIdxMap, State.gregs[i]);
+  }
+
+  FillSRAFPRs(Thread, ucontext);
+
+  ArchHelpers::Context::SetArmPState(
+    ucontext, CTX->FlipHostEFLAGS(ChangedEFLAGS, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext)));
+#endif
+}
+
+ArchHelpers::Context::ContextBackup*
+SignalDelegator::StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext, bool IsGuestSignal) {
   // We can end up getting a signal at any point in our host state
   // Jump to a handler that saves all state so we can safely return
   uint64_t OldSP = ArchHelpers::Context::GetSp(ucontext);
@@ -171,6 +212,16 @@ ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::
   Context->UContextLocation = 0;
   Context->SigInfoLocation = 0;
   Context->InSyscallInfo = Thread->CurrentFrame->InSyscallInfo;
+
+  auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
+  if (IsGuestSignal && ThreadObject->SignalInfo.InSigSuspend) {
+    // POSIX/Linux sigsuspend: a signal delivered during sigsuspend saves the pre-suspend mask
+    // so rt_sigreturn restores it rather than leaking the temporary suspend mask.
+    Context->GuestSigMask = ThreadObject->SignalInfo.PreviousSuspendMask.Val;
+    ThreadObject->SignalInfo.InSigSuspend = false;
+  } else {
+    Context->GuestSigMask = ThreadObject->SignalInfo.CurrentSignalMask.Val;
+  }
 
   // Store fault to top status and then reset it
   Context->FaultToTopAndGeneratedException = Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException;
@@ -266,30 +317,56 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   // over live stack.
   Thread->CurrentFrame->InSyscallInfo = Context->InSyscallInfo;
 
+  uint64_t RestoredGuestMask = Context->GuestSigMask;
   if (Context->UContextLocation) {
     auto Frame = Thread->CurrentFrame;
 
-    if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) {
-      // XXX: Unsupported since it needs state reconstruction
-      // If we are in the JIT then SRA might need to be restored to values from the context
-      // We can't currently support this since it might result in tearing without real state reconstruction
-    }
-
+    // Like the kernel, take the whole guest state (including uc_sigmask) from the signal frame,
+    // so changes the handler made to it take effect.
     if (Is64BitMode) {
-      RestoreFrame_x64(Thread, Context, Frame, ucontext);
+      RestoredGuestMask = RestoreFrame_x64(Thread, Context, Frame);
     } else {
       if (Type == RestoreType::TYPE_NONREALTIME) {
-        RestoreFrame_ia32(Thread, Context, Frame, ucontext);
+        RestoredGuestMask = RestoreFrame_ia32(Thread, Context, Frame);
       } else {
-        RestoreRTFrame_ia32(Thread, Context, Frame, ucontext);
+        RestoredGuestMask = RestoreRTFrame_ia32(Thread, Context, Frame);
       }
     }
+
+    if (Context->OriginalRIP != Frame->State.rip || Context->FaultToTopAndGeneratedException) {
+      // The guest moved RIP, go back to the top of the dispatcher to run from there
+      // The dispatcher will run a different guest instruction, so the interrupted syscall won't clear its spill mask.
+      Frame->InSyscallInfo = 0;
+      ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
+      ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
+      // Set our state register to point to our guest thread data
+      ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+    } else if (Context->Flags &
+               (ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT | ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER)) {
+      // The interrupted code resumes with the static registers it holds in host registers, put the frame's values there.
+      // Flags only get the handler's changes: the JIT may hold them in a different form at this point.
+      const uint32_t ChangedEFLAGS = Context->OriginalEFLAGS ^ CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+      FillSRA(Thread, ucontext, Context->InSyscallInfo & 0xFFFF, ChangedEFLAGS);
+    } else if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT) {
+      // The interrupted NoFP leaf thunk resumes without reloading static FPRs from the frame,
+      // so propagate any guest handler XMM modifications back into ucontext's static FPRs.
+      FillSRAFPRs(Thread, ucontext);
+    }
+  }
+
+  if (Type != RestoreType::TYPE_PAUSE) {
+    constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    RestoredGuestMask &= IgnoredSignalsMask;
+    auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
+    ThreadObject->SignalInfo.CurrentSignalMask.Val = RestoredGuestMask;
+    const uint64_t RestoredHostMask = MaskToHostSigMask(RestoredGuestMask | GetDeferredSignalsMask(ThreadObject));
+    memcpy(&ArchHelpers::Context::GetUContext(ucontext)->uc_sigmask, &RestoredHostMask, sizeof(uint64_t));
   }
 }
 
 bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext,
                                                   GuestSigAction* GuestAction, stack_t* GuestStack) {
-  auto ContextBackup = StoreThreadState(Thread, Signal, ucontext);
+  auto ContextBackup = StoreThreadState(Thread, Signal, ucontext, true);
 
   auto Frame = Thread->CurrentFrame;
 
@@ -303,7 +380,15 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // Spill the SRA regardless of signal handler type
   // We are going to be returning to the top of the dispatcher which will fill again
   // Otherwise we might load garbage
-  if (WasInJIT) {
+  // A thunk call sets IN_THUNK_CALL only once every static register is spilled to the frame, and clears it
+  // only once they are filled again. JIT or dispatcher code executing while IN_THUNK_CALL is set (DEF_OP(Thunk),
+  // CallbackPtr prologue, CallbackReturn epilogue) may hold clobbered host values in static host registers
+  // (notably x8 = guest RSP, which host thunks clobber with Linux syscall numbers). The frame holds the
+  // authoritative guest state, so neither spill nor refill SRA here.
+  const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+  const bool FprsUnspilled = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED) != 0;
+
+  if (WasInJIT && !InThunkCall) {
     uint32_t IgnoreMask {};
 #ifdef ARCHITECTURE_arm64
     if (Frame->InSyscallInfo != 0) {
@@ -322,17 +407,32 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     SpillSRA(Thread, ucontext, IgnoreMask);
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
-  } else {
-    if (!IsAddressInDispatcher(OldPC)) {
-      // This is likely to cause issues but in some cases it isn't fatal
-      // This can also happen if we have put a signal on hold, then we just reenabled the signal
-      // So we are in the syscall handler
-      // Only throw a log message in this case
-      if constexpr (false) {
-        // XXX: Messages in the signal handler can cause us to crash
-        LogMan::Msg::EFmt("Signals in dispatcher have unsynchronized context");
+  } else if (WasInJIT && InThunkCall) {
+    // Reconstruct the thunk instruction RIP without touching the already-spilled static GPRs.
+    Frame->State.rip = CTX->RestoreRIPFromHostPC(Thread, OldPC);
+    if (FprsUnspilled) {
+      SpillSRAFPRs(Thread, ucontext);
+      ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
+    }
+  } else if (IsAddressInDispatcher(OldPC) && !InThunkCall) {
+    if (FprsUnspilled) {
+      SpillSRAFPRs(Thread, ucontext);
+      ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
+    } else {
+      // Signals only arrive at points where the dispatcher holds the guest state in both the frame and the static registers.
+      ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER;
+    }
+  } else if (FprsUnspilled) {
+    // Interrupted inside a NoFP leaf thunk (e.g., host kernel vDSO): static GPRs are already in Frame->State,
+    // while static FPRs (v16..v31) remain live in ucontext. Spill FPRs into Frame->State and reconstruct guest RIP
+    // from the active thunk JIT block header (NoFP leaf thunks never make re-entrant guest callbacks).
+    SpillSRAFPRs(Thread, ucontext);
+    if (InThunkCall) {
+      if (const uint64_t BlockEntry = CTX->GetGuestBlockEntry(Thread); BlockEntry != 0) {
+        Frame->State.rip = BlockEntry;
       }
     }
+    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
   }
 
   // The guest handler isn't in a syscall, even when the signal arrived in the syscall handler. StoreThreadState saved the
@@ -363,6 +463,7 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
 
   ContextBackup->OriginalRIP = Thread->CurrentFrame->State.rip;
   uint32_t eflags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+  ContextBackup->OriginalEFLAGS = eflags;
 
   if (Is64BitMode) {
     NewGuestSP = SetupFrame_x64(Thread, ContextBackup, Frame, Signal, HostSigInfo, ucontext, GuestAction, GuestStack, NewGuestSP, eflags);
@@ -435,11 +536,11 @@ bool SignalDelegator::HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, i
     // We use this to track if it is safe to clear cache
     --Thread->CurrentFrame->SignalHandlerRefCounter;
 
-    if (ThreadObject->SignalInfo.DeferredSignalFrames.size() != 0) {
-      // If we have more deferred frames to process then mprotect back to PROT_NONE.
-      // It will have been RW coming in to this sigreturn and now we need to remove permissions
-      // to ensure FEX trampolines back to the SIGSEGV deferred handler.
-      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    if (ThreadObject->SignalInfo.DeferredSignalFrameCount != 0) {
+      // Keep InterruptFaultPage in sync with the restored mask: re-arm to PROT_NONE if any
+      // queued deferred signal is now deliverable, or disarm to RW if all remain blocked.
+      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage),
+               HasDeliverableDeferredSignal(ThreadObject) ? PROT_NONE : (PROT_READ | PROT_WRITE));
     }
     return true;
   }
@@ -463,16 +564,27 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
 
   if (SignalReason == SignalEvent::Pause) {
     // Store our thread state so we can come back to this
-    StoreThreadState(Thread, Signal, ucontext);
+    StoreThreadState(Thread, Signal, ucontext, false);
 
-    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext))) {
+    const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+    const bool FprsUnspilled = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED) != 0;
+    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !InThunkCall) {
       // We are in jit, SRA must be spilled
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadPauseHandlerAddressSpillSRA);
     } else {
-      // We are in non-jit, SRA is already spilled
+      // We are in non-jit, SRA GPRs are already spilled; sync live FPRs and clear AFP if unspilled.
+      // StoreThreadState already saved the original FPCR in ContextBackup so resume restores it.
+      if (FprsUnspilled) {
+        SpillSRAFPRs(Thread, ucontext);
+#ifdef ARCHITECTURE_arm64
+        ArchHelpers::Context::ClearArmAFP(ucontext);
+#endif
+      }
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)), "Signals in dispatcher have unsynchronized "
-                                                                                        "context");
+      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall || FprsUnspilled, "Signals in "
+                                                                                                                        "dispatcher have "
+                                                                                                                        "unsynchronized "
+                                                                                                                        "context");
 #endif
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadPauseHandlerAddress);
     }
@@ -498,14 +610,23 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
     Thread->CurrentFrame->SignalHandlerRefCounter = 0;
 
     // Set the new PC
-    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext))) {
+    const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+    const bool FprsUnspilled = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED) != 0;
+    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !InThunkCall) {
       // We are in jit, SRA must be spilled
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadStopHandlerAddressSpillSRA);
     } else {
-      // We are in non-jit, SRA is already spilled
+      // We are in non-jit, SRA is already spilled; clear AFP before returning to host C++.
+      if (FprsUnspilled) {
+#ifdef ARCHITECTURE_arm64
+        ArchHelpers::Context::ClearArmAFP(ucontext);
+#endif
+      }
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)), "Signals in dispatcher have unsynchronized "
-                                                                                        "context");
+      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall || FprsUnspilled, "Signals in "
+                                                                                                                        "dispatcher have "
+                                                                                                                        "unsynchronized "
+                                                                                                                        "context");
 #endif
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadStopHandlerAddress);
     }
@@ -529,6 +650,11 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
     // Ref count our faults
     // We use this to track if it is safe to clear cache
     --Thread->CurrentFrame->SignalHandlerRefCounter;
+
+    if (ThreadObject->SignalInfo.DeferredSignalFrameCount != 0) {
+      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage),
+               HasDeliverableDeferredSignal(ThreadObject) ? PROT_NONE : (PROT_READ | PROT_WRITE));
+    }
 
     ThreadObject->SignalReason.store(SignalEvent::Nothing);
     return true;
@@ -567,25 +693,52 @@ static bool IsAsyncSignal(const siginfo_t* Info, int Signal) {
   return true;
 }
 
-uint64_t SignalDelegator::GetNewSigMask(int Signal) const {
+uint64_t SignalDelegator::GetGuestSignalHandlerMask(int Signal, uint64_t ExistingMask) const {
   const SignalHandler& Handler = HostHandlers[Signal];
-  // Set up a new mask based on this signals signal mask
-  uint64_t NewMask = Handler.GuestAction.sa_mask.Val;
+  // POSIX/Linux signal delivery adds sa_mask (and Signal itself unless SA_NODEFER)
+  // to the thread's existing blocked mask rather than replacing it.
+  uint64_t NewMask = ExistingMask | Handler.GuestAction.sa_mask.Val;
 
-  // If NODEFER then the new signal mask includes this signal
+  // If !SA_NODEFER then the new signal mask includes this signal
   if (!(Handler.GuestAction.sa_flags & SA_NODEFER)) {
     NewMask |= (1ULL << (Signal - 1));
   }
 
+  constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  return NewMask & IgnoredSignalsMask;
+}
+
+uint64_t SignalDelegator::MaskToHostSigMask(uint64_t GuestMask) const {
   // Walk our required signals and stop masking them if requested
   for (size_t i = 0; i < MAX_SIGNALS; ++i) {
     if (HostHandlers[i + 1].Required.load(std::memory_order_relaxed)) {
       // Never mask our required signals
-      NewMask &= ~(1ULL << i);
+      GuestMask &= ~(1ULL << i);
     }
   }
 
-  return NewMask;
+  return GuestMask;
+}
+
+uint64_t SignalDelegator::GetDeferredSignalsMask(const FEX::HLE::ThreadStateObject* ThreadObject) const {
+  uint64_t Mask {};
+  for (size_t i = 0; i < ThreadObject->SignalInfo.DeferredSignalFrameCount; ++i) {
+    // Each queued frame contributes only its own signal bit so it cannot re-deliver while queued;
+    // the handler's sa_mask is applied when that handler is actually dispatched.
+    Mask |= (1ULL << (ThreadObject->SignalInfo.DeferredSignalFrames[i].Signal - 1));
+  }
+  return Mask;
+}
+
+bool SignalDelegator::HasDeliverableDeferredSignal(const FEX::HLE::ThreadStateObject* ThreadObject) const {
+  const uint64_t BlockedMask = ThreadObject->SignalInfo.CurrentSignalMask.Val;
+  for (size_t i = 0; i < ThreadObject->SignalInfo.DeferredSignalFrameCount; ++i) {
+    const int DeferredSignal = ThreadObject->SignalInfo.DeferredSignalFrames[i].Signal;
+    if ((BlockedMask & (1ULL << (DeferredSignal - 1))) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState* Thread, int Signal, void* Info, void* UContext) {
@@ -620,39 +773,68 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   auto SigInfo = *static_cast<siginfo_t*>(Info);
 
   auto MustDeferSignal = (Thread->CurrentFrame->State.DeferredSignalRefCount.Load() != 0);
+
+  // JIT and dispatcher code is only at a guest instruction boundary at its pending interrupt checks, and between them it
+  // can hold guest state the frame can't show, like a register mid-update or an address computed from one. Wait for the next
+  // check, so the guest handler sees and changes exact state. Not while the thread is marked as in a syscall: that state is
+  // exact as well, and a blocking syscall must be interrupted.
+  const auto PC = ArchHelpers::Context::GetPc(UContext);
+  const bool BetweenChecks = (CTX->IsAddressInCodeBuffer(Thread, PC) || IsAddressInDispatcher(PC)) && Thread->CurrentFrame->InSyscallInfo == 0;
+  bool FromDeferredFault = false;
   if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
-      // Pull a signal frame off the stack.
+      // Pull the newest deliverable (unblocked) signal frame off the stack.
 
       mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_READ | PROT_WRITE);
 
-      if (ThreadObject->SignalInfo.DeferredSignalFrames.empty()) {
-        // No signals to defer. Just set the fault page back to RW and continue execution.
-        // This occurs as a minor race condition between the refcount decrement and the access to the fault page.
+      const uint64_t BlockedMask = ThreadObject->SignalInfo.CurrentSignalMask.Val;
+      size_t SelectedIdx = ThreadObject->SignalInfo.DeferredSignalFrameCount;
+      for (size_t i = ThreadObject->SignalInfo.DeferredSignalFrameCount; i > 0; --i) {
+        const int DeferredSignal = ThreadObject->SignalInfo.DeferredSignalFrames[i - 1].Signal;
+        if ((BlockedMask & (1ULL << (DeferredSignal - 1))) == 0) {
+          SelectedIdx = i - 1;
+          break;
+        }
+      }
+
+      if (SelectedIdx == ThreadObject->SignalInfo.DeferredSignalFrameCount) {
+        // Either no deferred signals remain, or every deferred signal is currently masked by
+        // CurrentSignalMask (e.g. inside a synchronous SIGSEGV handler whose sa_mask blocks SIGUSR1).
+        // Leave InterruptFaultPage RW and preserve uc_sigmask; rt_sigreturn or rt_sigprocmask will
+        // re-arm InterruptFaultPage once a deferred signal becomes unblocked.
         return;
       }
 
-      const auto& Top = ThreadObject->SignalInfo.DeferredSignalFrames.back();
-      Signal = Top.Signal;
-      SigInfo = Top.Info;
-      // sig mask has been updated at the defer time, recover the original mask
-      memcpy(&_context->uc_sigmask, &Top.SigMask, sizeof(uint64_t));
-      ThreadObject->SignalInfo.DeferredSignalFrames.pop_back();
+      const auto Selected = ThreadObject->SignalInfo.DeferredSignalFrames[SelectedIdx];
+      for (size_t i = SelectedIdx; i + 1 < ThreadObject->SignalInfo.DeferredSignalFrameCount; ++i) {
+        ThreadObject->SignalInfo.DeferredSignalFrames[i] = ThreadObject->SignalInfo.DeferredSignalFrames[i + 1];
+      }
+      --ThreadObject->SignalInfo.DeferredSignalFrameCount;
+
+      Signal = Selected.Signal;
+      SigInfo = Selected.Info;
+      // Remove only the popped signal's temporary defer mask while preserving CurrentSignalMask
+      // (including any enclosing synchronous signal handler's sa_mask) and remaining deferred masks.
+      const uint64_t RestoredHostMask = MaskToHostSigMask(ThreadObject->SignalInfo.CurrentSignalMask.Val | GetDeferredSignalsMask(ThreadObject));
+      memcpy(&_context->uc_sigmask, &RestoredHostMask, sizeof(uint64_t));
+      FromDeferredFault = true;
 
       // Until we re-protect the page to PROT_NONE, FEX will now *permanently* defer signals and /not/ check them.
       //
       // In order to return /back/ to a sane state, we wait for the rt_sigreturn to happen.
-      // rt_sigreturn will check if there are any more deferred signals to handle
-      // - If there are deferred signals
+      // rt_sigreturn will check if there are any more deliverable deferred signals to handle
+      // - If there are deliverable deferred signals
       //   - mprotect back to PROT_NONE
       //   - sigreturn will trampoline out to the previous fault address check, SIGSEGV and restart
-      // - If there are *no* deferred signals
+      // - If there are *no* deliverable deferred signals
       //  - No need to mprotect, it is already RW
+      // If this popped signal does NOT invoke a guest handler (SIG_IGN / DEFAULT_IGNORE / OldAction),
+      // rt_sigreturn will never run, so we must re-protect InterruptFaultPage before returning if more deliverable frames remain.
     } else {
 #ifdef ARCHITECTURE_arm64
       // If RefCount != 0 then that means we hit an access with nested signal-deferring sections.
-      // Increment the PC past the `str zr, [x1]` to continue code execution until we reach the outermost section.
+      // Increment the PC past the 4-byte InterruptFaultPage access (`str`/`ldr zr, [...]`) until we reach the outermost section.
       ArchHelpers::Context::SetPc(UContext, ArchHelpers::Context::GetPc(UContext) + 4);
       return;
 #else
@@ -661,42 +843,65 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       ERROR_AND_DIE_FMT("X86 shouldn't hit this InterruptFaultPage");
 #endif
     }
-  } else if (IsAsyncSignal(&SigInfo, Signal) && MustDeferSignal) {
-    // If the signal is asynchronous (as determined by si_code) and FEX is in a state of needing
-    // to defer the signal, then add the signal to the thread's signal queue.
-    LOGMAN_THROW_A_FMT(ThreadObject->SignalInfo.DeferredSignalFrames.size() != ThreadObject->SignalInfo.DeferredSignalFrames.capacity(),
-                       "Deferred signals vector hit "
-                       "capacity size. This will "
-                       "likely crash! Asserting now!");
+  } else if (IsAsyncSignal(&SigInfo, Signal) &&
+             ((ThreadObject->SignalInfo.CurrentSignalMask.Val & (1ULL << (Signal - 1))) || MustDeferSignal || BetweenChecks)) {
+    const bool SignalIsMasked = (ThreadObject->SignalInfo.CurrentSignalMask.Val & (1ULL << (Signal - 1))) != 0;
+
+    // If the signal is asynchronous (as determined by si_code) and either currently blocked by the
+    // guest signal mask (e.g. a Required host signal like SIGSEGV/SIGILL/SIGBUS raised while masked
+    // by sigprocmask or an active handler's sa_mask) or FEX must defer it to a safe boundary, queue
+    // it in DeferredSignalFrames so siginfo, RT multiplicity, and rt_sigreturn/sigprocmask/sigsuspend
+    // delivery are preserved.
+    // Standard (non-realtime) signals (1..31) do not queue on Linux: coalesce duplicates
+    // (which can arrive with SA_NODEFER or while masked) instead of consuming additional slots.
+    constexpr int LINUX_SIGRTMIN = 32;
+    if (Signal < LINUX_SIGRTMIN) {
+      for (size_t i = 0; i < ThreadObject->SignalInfo.DeferredSignalFrameCount; ++i) {
+        if (ThreadObject->SignalInfo.DeferredSignalFrames[i].Signal == Signal) {
+          if (!SignalIsMasked) {
+            mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+          }
+          return;
+        }
+      }
+    }
+
+    // Never allocate inside a signal handler. If the fixed queue is full, record as pending
+    // without altering uc_sigmask so the signal mask cannot leak.
+    if (ThreadObject->SignalInfo.DeferredSignalFrameCount >= ThreadStateObject::MAX_DEFERRED_SIGNALS) {
+      ThreadObject->SignalInfo.PendingSignals |= 1ULL << (Signal - 1);
+      return;
+    }
 
     // Peek into sigset_t implementation details, extracting the __val member for glibc and __bits for musl
     auto& [sigmask_val] = _context->uc_sigmask;
     static_assert(sizeof(sigmask_val[0]) == sizeof(uint64_t), "Unknown sigset_t layout");
 
-    ThreadObject->SignalInfo.DeferredSignalFrames.emplace_back(ThreadStateObject::DeferredSignalState {
+    ThreadObject->SignalInfo.DeferredSignalFrames[ThreadObject->SignalInfo.DeferredSignalFrameCount++] = ThreadStateObject::DeferredSignalState {
       .Info = SigInfo,
       .Signal = Signal,
-      .SigMask = sigmask_val[0],
-    });
+    };
 
-    // Update our host signal mask so we don't hit race conditions with signals
-    // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-    sigmask_val[0] = GetNewSigMask(Signal);
+    // Mask only this queued signal on the host (if not Required) so it cannot re-deliver while
+    // queued, while preserving already-blocked signals; the handler's sa_mask applies on dispatch.
+    sigmask_val[0] |= MaskToHostSigMask(1ULL << (Signal - 1));
 
-    // Now update the faulting page permissions so it will fault on write.
-    mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    // Only arm InterruptFaultPage when this signal is currently deliverable. Signals queued
+    // because CurrentSignalMask blocks them will arm InterruptFaultPage once unmasked by
+    // rt_sigreturn, GuestSigProcMask, or GuestSigSuspend.
+    if (!SignalIsMasked) {
+      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    }
 
-    // Postpone the remainder of signal handling logic until we process the SIGSEGV triggered by writing to InterruptFaultPage.
+    // Postpone the remainder of signal handling logic until we process the SIGSEGV triggered by accessing InterruptFaultPage.
     return;
   }
 
-  // Check for masked signals
-  if (ThreadObject->SignalInfo.CurrentSignalMask.Val & (1ULL << (Signal - 1)) && IsAsyncSignal(&SigInfo, Signal)) {
-    // This signal is masked, must defer until the guest updates the signal mask.
-    // Add it to the pending signal list
-    ThreadObject->SignalInfo.PendingSignals |= 1ULL << (Signal - 1);
-    return;
-  }
+  auto RearmDeferredFaultIfNeeded = [&]() {
+    if (FromDeferredFault && HasDeliverableDeferredSignal(ThreadObject)) {
+      mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_NONE);
+    }
+  };
 
   // Let the host take first stab at handling the signal
   SignalHandler& Handler = HostHandlers[Signal];
@@ -711,15 +916,25 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       // This way the parent process can know it died correctly
     }
   } else if (Handler.GuestAction.sigaction_handler.handler == SIG_IGN) {
+    RearmDeferredFaultIfNeeded();
     return;
   } else {
     if (Handler.GuestHandler &&
         Handler.GuestHandler(Thread, Signal, &SigInfo, UContext, &Handler.GuestAction, &ThreadObject->SignalInfo.GuestAltStack)) {
-      uint64_t NewMask = GetNewSigMask(Signal);
+      // POSIX/Linux signal delivery ORs sa_mask (and Signal unless SA_NODEFER) into the existing blocked mask.
+      const uint64_t NewGuestMask = GetGuestSignalHandlerMask(Signal, ThreadObject->SignalInfo.CurrentSignalMask.Val);
+      ThreadObject->SignalInfo.CurrentSignalMask.Val = NewGuestMask;
 
-      // Update our host signal mask so we don't hit race conditions with signals
-      // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
-      memcpy(&_context->uc_sigmask, &NewMask, sizeof(uint64_t));
+      const uint64_t NewHostMask = MaskToHostSigMask(NewGuestMask | GetDeferredSignalsMask(ThreadObject));
+      memcpy(&_context->uc_sigmask, &NewHostMask, sizeof(uint64_t));
+
+      // Keep InterruptFaultPage in sync with remaining deferred frames under NewGuestMask:
+      // re-arm to PROT_NONE if another unblocked deferred signal remains (so a long-running or
+      // non-returning handler cannot starve it), or disarm to RW if NewGuestMask blocks them all.
+      if (ThreadObject->SignalInfo.DeferredSignalFrameCount != 0) {
+        mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage),
+                 HasDeliverableDeferredSignal(ThreadObject) ? PROT_NONE : (PROT_READ | PROT_WRITE));
+      }
 
       // We handled this signal, continue running
       return;
@@ -761,6 +976,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   } else {
     Handler.OldAction.handler(Signal);
   }
+  RearmDeferredFaultIfNeeded();
 }
 
 void SignalDelegator::SaveTelemetry() {
@@ -809,9 +1025,11 @@ bool SignalDelegator::UpdateHostThunk(int Signal) {
   // SA_SIGINFO : Host always needs SA_SIGINFO
   // SA_ONSTACK : Host always needs the altstack
   // SA_RESETHAND : We don't support one shot handlers
+  // SA_NODEFER : Host thunk must not be re-entered asynchronously while mutating signal state;
+  //              guest SA_NODEFER is honored when computing uc_sigmask in HandleGuestSignal.
   // SA_RESTORER : We always need our host side restorer on x86-64, Couldn't use guest restorer anyway
-  SignalHandler.HostAction.sa_flags = CheckAndAddFlags(SignalHandler.HostAction.sa_flags, SignalHandler.GuestAction.sa_flags,
-                                                       SA_NOCLDSTOP | SA_NOCLDWAIT | SA_NODEFER | SA_RESTART);
+  SignalHandler.HostAction.sa_flags =
+    CheckAndAddFlags(SignalHandler.HostAction.sa_flags, SignalHandler.GuestAction.sa_flags, SA_NOCLDSTOP | SA_NOCLDWAIT | SA_RESTART);
 
 #ifdef ARCHITECTURE_x86_64
 #define SA_RESTORER 0x04000000
@@ -819,17 +1037,12 @@ bool SignalDelegator::UpdateHostThunk(int Signal) {
   SignalHandler.HostAction.restorer = sigrestore;
 #endif
 
-  // Walk the signals we have that are required and make sure to remove it from the mask
-  // This'll likely be SIGILL, SIGBUS, SIG63
-
-  // If the guest has masked some signals then we need to also mask those signals
-  for (size_t i = 1; i < HostHandlers.size(); ++i) {
-    if (HostHandlers[i].Required.load(std::memory_order_relaxed)) {
-      SignalHandler.HostAction.sa_mask &= ~(1ULL << (i - 1));
-    } else if (SigIsMember(&SignalHandler.GuestAction.sa_mask, i)) {
-      SignalHandler.HostAction.sa_mask |= (1ULL << (i - 1));
-    }
-  }
+  // Mask all non-Required signals while the host SignalHandlerThunk executes so another async
+  // signal cannot re-enter SignalHandlerThunk mid-SpillSRA, mid-DeferredSignalFrames mutation,
+  // mid-RestoreThreadState, or while holding GuestDelegatorMutex (SA_RESETHAND).
+  // Required signals (SIGSEGV, SIGBUS, SIGILL, SIGNAL_FOR_PAUSE) stay unmasked; guest masking
+  // (sa_mask and SA_NODEFER) is enforced via ucontext->uc_sigmask on return from the thunk.
+  SignalHandler.HostAction.sa_mask = MaskToHostSigMask(~0ULL);
 
   // Check for SIG_IGN
   if (SignalHandler.GuestAction.sigaction_handler.handler == SIG_IGN && HostHandlers[Signal].Required.load(std::memory_order_relaxed) == false) {
@@ -1056,45 +1269,59 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
 
   // Get the current host signal mask
   ::syscall(SYS_rt_sigprocmask, 0, nullptr, &Thread->SignalInfo.CurrentSignalMask.Val, 8);
-
-  if (Thread->Thread) {
-    // Reserve a small amount of deferred signal frames. Usually the stack won't be utilized beyond
-    // 1 or 2 signals but add a few more just in case.
-    Thread->SignalInfo.DeferredSignalFrames.reserve(8);
-  }
 }
 
 void SignalDelegator::UninstallTLSState(FEX::HLE::ThreadStateObject* Thread) {
-  FEXCore::Allocator::munmap(Thread->SignalInfo.AltStackPtr, SIGSTKSZ * 16);
-
-  Thread->SignalInfo.AltStackPtr = nullptr;
-
   stack_t altstack {};
   altstack.ss_flags = SS_DISABLE;
 
-  // Uninstall the alt stack
+  // Uninstall the alt stack before unmapping its backing memory.
   const int Result = sigaltstack(&altstack, nullptr);
   if (Result == -1) {
     LogMan::Msg::EFmt("Failed to uninstall alternative signal stack {}", strerror(errno));
   }
 
+  // Clear allocator TLS before munmap so the 64-bit allocator's DeferredSignalRefCountGuard
+  // cannot touch InterruptFaultPage while SIGSEGV is raw-masked on thread exit.
   FEXCore::Allocator::UninstallTLSData(Thread->Thread);
+
+  FEXCore::Allocator::munmap(Thread->SignalInfo.AltStackPtr, SIGSTKSZ * 16);
+
+  Thread->SignalInfo.AltStackPtr = nullptr;
+}
+
+void SignalDelegator::InstallOrUpdateRequiredHostThunk(int Signal, bool Required) {
+  HostHandlers[Signal].Required = Required;
+  if (Signal == 0 || Signal == SIGKILL || Signal == SIGSTOP) {
+    return;
+  }
+  if (!InstallHostThunk(Signal) && Required) {
+    UpdateHostThunk(Signal);
+  }
+  if (Required) {
+    // Ensure previously-installed host thunks do not mask this newly-required signal.
+    const uint64_t Bit = 1ULL << (Signal - 1);
+    for (size_t i = 1; i < HostHandlers.size(); ++i) {
+      if (i != static_cast<size_t>(Signal) && i != SIGKILL && i != SIGSTOP && HostHandlers[i].Installed &&
+          (HostHandlers[i].HostAction.sa_mask & Bit)) {
+        UpdateHostThunk(i);
+      }
+    }
+  }
 }
 
 void SignalDelegator::FrontendRegisterHostSignalHandler(int Signal, bool Required) {
   // Linux signal handlers are per-process rather than per thread
   // Multiple threads could be calling in to this
   std::lock_guard lk(HostDelegatorMutex);
-  HostHandlers[Signal].Required = Required;
-  InstallHostThunk(Signal);
+  InstallOrUpdateRequiredHostThunk(Signal, Required);
 }
 
 void SignalDelegator::FrontendRegisterFrontendHostSignalHandler(int Signal, bool Required) {
   // Linux signal handlers are per-process rather than per thread
   // Multiple threads could be calling in to this
   std::lock_guard lk(HostDelegatorMutex);
-  HostHandlers[Signal].Required = Required;
-  InstallHostThunk(Signal);
+  InstallOrUpdateRequiredHostThunk(Signal, Required);
 }
 
 void SignalDelegator::RegisterHostSignalHandlerForGuest(int Signal, FEX::HLE::HostSignalDelegatorFunctionForGuest Func) {
@@ -1108,37 +1335,53 @@ void SignalDelegator::RegisterFrontendHostSignalHandler(int Signal, HostSignalDe
 }
 
 uint64_t SignalDelegator::RegisterGuestSignalHandler(int Signal, const GuestSigAction* Action, GuestSigAction* OldAction) {
-  std::lock_guard lk(GuestDelegatorMutex);
-
   // Invalid signal specified
   if (Signal > MAX_SIGNALS) {
     return -EINVAL;
   }
 
-  // If we have an old signal set then give it back
-  if (OldAction) {
-    *OldAction = HostHandlers[Signal].GuestAction;
+  // These signal dispositions can't be changed on Linux
+  if (Action && (Signal == SIGKILL || Signal == SIGSTOP)) {
+    return -EINVAL;
   }
 
-  // Now assign the new action
+  // Copy Action from guest memory before masking SIGSEGV so any MTRACK write-protection fault
+  // or bad guest pointer is handled normally instead of killing the process while SIGSEGV is masked.
+  GuestSigAction NewAction {};
   if (Action) {
-    // These signal dispositions can't be changed on Linux
-    if (Signal == SIGKILL || Signal == SIGSTOP) {
-      return -EINVAL;
+    NewAction = *Action;
+  }
+
+  GuestSigAction SavedOldAction {};
+  {
+    // Mask signals while holding GuestDelegatorMutex so an async signal cannot suspend this thread
+    // (or re-enter via SA_RESETHAND in HandleDispatcherGuestSignal) while holding the lock.
+    auto lk = FEXCore::MaskSignalsAndLockMutex(GuestDelegatorMutex);
+
+    if (OldAction) {
+      SavedOldAction = HostHandlers[Signal].GuestAction;
     }
 
-    HostHandlers[Signal].GuestAction = *Action;
-    // Only attempt to install a new thunk handler if we were installing a new guest action
-    if (!InstallHostThunk(Signal)) {
-      UpdateHostThunk(Signal);
+    // Now assign the new action
+    if (Action) {
+      HostHandlers[Signal].GuestAction = NewAction;
+      // Only attempt to install a new thunk handler if we were installing a new guest action
+      if (!InstallHostThunk(Signal)) {
+        UpdateHostThunk(Signal);
+      }
     }
+  }
+
+  // Write OldAction back to guest memory after unmasking SIGSEGV.
+  if (OldAction) {
+    *OldAction = SavedOldAction;
   }
 
   return 0;
 }
 
 void SignalDelegator::CheckXIDHandler() {
-  std::lock_guard lk(GuestDelegatorMutex);
+  auto lk = FEXCore::MaskSignalsAndLockMutex(GuestDelegatorMutex);
   std::lock_guard lk2(HostDelegatorMutex);
 
   constexpr size_t SIGNAL_SETXID = 33;
@@ -1238,31 +1481,49 @@ uint64_t SignalDelegator::GuestSigProcMask(FEX::HLE::ThreadStateObject* Thread, 
   // 1) Store old mask
   // 2) Set mask to new mask if exists
   // 3) Give old mask back
-  auto OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
+  uint64_t OldSet {};
 
   if (set) {
-    uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    if (how == SIG_BLOCK) {
-      Thread->SignalInfo.CurrentSignalMask.Val |= *set & IgnoredSignalsMask;
-    } else if (how == SIG_UNBLOCK) {
-      Thread->SignalInfo.CurrentSignalMask.Val &= ~(*set & IgnoredSignalsMask);
-    } else if (how == SIG_SETMASK) {
-      Thread->SignalInfo.CurrentSignalMask.Val = *set & IgnoredSignalsMask;
-    } else {
+    if (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
       return -EINVAL;
     }
 
-    uint64_t HostMask = Thread->SignalInfo.CurrentSignalMask.Val;
-    // Now actually set the host mask
-    // This will hide from the guest that we are not actually setting all of the masks it wants
-    for (size_t i = 0; i < MAX_SIGNALS; ++i) {
-      if (HostHandlers[i + 1].Required.load(std::memory_order_relaxed)) {
-        // If it is a required host signal then we can't mask it
-        HostMask &= ~(1ULL << i);
-      }
+    // Read *set from guest memory before masking SIGSEGV so a bad guest pointer or MTRACK fault
+    // is handled normally rather than crashing with SIGSEGV blocked.
+    constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    const uint64_t MaskedSet = *set & IgnoredSignalsMask;
+
+    // Unconditionally mask all signals while reading/updating CurrentSignalMask, inspecting
+    // DeferredSignalFrames, syncing InterruptFaultPage, and installing HostMask so an async
+    // signal cannot race in between and leave HostMask or DeferredSignalFrames inconsistent.
+    constexpr uint64_t AllSignals = ~0ULL;
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+
+    OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
+    uint64_t NewMask = OldSet;
+    if (how == SIG_BLOCK) {
+      NewMask |= MaskedSet;
+    } else if (how == SIG_UNBLOCK) {
+      NewMask &= ~MaskedSet;
+    } else {
+      NewMask = MaskedSet;
+    }
+
+    Thread->SignalInfo.CurrentSignalMask.Val = NewMask;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+
+    // Now actually set the host mask, keeping any still-deferred signals' masks applied while hiding
+    // that required host signals cannot be masked.
+    uint64_t HostMask = MaskToHostSigMask(NewMask | GetDeferredSignalsMask(Thread));
+
+    if (Thread->Thread && Thread->SignalInfo.DeferredSignalFrameCount != 0) {
+      mprotect(reinterpret_cast<void*>(&Thread->Thread->InterruptFaultPage), sizeof(Thread->Thread->InterruptFaultPage),
+               HasDeliverableDeferredSignal(Thread) ? PROT_NONE : (PROT_READ | PROT_WRITE));
     }
 
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &HostMask, nullptr, 8);
+  } else {
+    OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
   }
 
   if (oldset) {
@@ -1279,7 +1540,11 @@ uint64_t SignalDelegator::GuestSigPending(FEX::HLE::ThreadStateObject* Thread, u
     return -EINVAL;
   }
 
-  *set = Thread->SignalInfo.PendingSignals;
+  uint64_t DeferredSignals {};
+  for (size_t i = 0; i < Thread->SignalInfo.DeferredSignalFrameCount; ++i) {
+    DeferredSignals |= 1ULL << (Thread->SignalInfo.DeferredSignalFrames[i].Signal - 1);
+  }
+  *set = (Thread->SignalInfo.PendingSignals | DeferredSignals) & Thread->SignalInfo.CurrentSignalMask.Val;
 
   sigset_t HostSet {};
   if (sigpending(&HostSet) == 0) {
@@ -1301,40 +1566,83 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
     return -EINVAL;
   }
 
-  uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  // Read *set from guest memory before masking signals so bad pointers or MTRACK faults
+  // still fault cleanly with SIGSEGV unmasked.
+  const uint64_t SuspendMask = *set & IgnoredSignalsMask;
 
-  // Backup the mask
-  Thread->SignalInfo.PreviousSuspendMask = Thread->SignalInfo.CurrentSignalMask;
-  // Set the new mask
-  Thread->SignalInfo.CurrentSignalMask.Val = *set & IgnoredSignalsMask;
-  sigset_t HostSet {};
+  // Mask all signals (including Required) before snapshotting CurrentSignalMask and
+  // transitioning PreviousSuspendMask, CurrentSignalMask, and InSigSuspend together, so
+  // no async signal can mutate CurrentSignalMask (via uc_sigmask) after the read and no
+  // cross-thread Required signal can observe SuspendMask while InSigSuspend is still false.
+  constexpr uint64_t AllSignals = ~0ULL;
+  const uint64_t BlockAsyncMask = MaskToHostSigMask(~0ULL);
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+  std::atomic_signal_fence(std::memory_order_seq_cst);
 
-  sigemptyset(&HostSet);
+  const uint64_t SavedPreSuspendMask = Thread->SignalInfo.CurrentSignalMask.Val;
+  Thread->SignalInfo.PreviousSuspendMask.Val = SavedPreSuspendMask;
+  Thread->SignalInfo.CurrentSignalMask.Val = SuspendMask;
+  Thread->SignalInfo.InSigSuspend = true;
+  std::atomic_signal_fence(std::memory_order_seq_cst);
 
-  for (int32_t i = 0; i < MAX_SIGNALS; ++i) {
-    if (*set & (1ULL << i)) {
-      sigaddset(&HostSet, i + 1);
-    }
+  // Deliver any FEX-queued deferred signals unblocked by SuspendMask before sleeping in host
+  // rt_sigsuspend (the kernel does not know about FEX's per-thread deferred queue).
+  // Triggering InterruptFaultPage while InSigSuspend is active lets HandleGuestSignal dispatch
+  // an unblocked deferred frame (saving SavedPreSuspendMask for rt_sigreturn and clearing
+  // InSigSuspend), or drain ignored frames and continue to host rt_sigsuspend.
+  while (Thread->SignalInfo.InSigSuspend && Thread->Thread && HasDeliverableDeferredSignal(Thread)) {
+    mprotect(reinterpret_cast<void*>(&Thread->Thread->InterruptFaultPage), sizeof(Thread->Thread->InterruptFaultPage), PROT_NONE);
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &BlockAsyncMask, nullptr, 8);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    auto* FaultPage = reinterpret_cast<FEXCore::Core::NonAtomicRefCounter<uint64_t>*>(&Thread->Thread->InterruptFaultPage);
+    FaultPage->Store(0);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
   }
 
-  // Additionally we must always listen to SIGNAL_FOR_PAUSE
-  // This technically forces us in to a race but should be fine
-  // SIGBUS and SIGILL can't happen so we don't need to listen for them
-  // sigaddset(&HostSet, SIGNAL_FOR_PAUSE);
+  uint64_t Result = static_cast<uint64_t>(-EINTR);
+  if (Thread->SignalInfo.InSigSuspend) {
+    // Move any overflow PendingSignals unblocked by SuspendMask into the kernel pending set
+    // while AllSignals stays masked, so host rt_sigsuspend atomically unmasks HostSuspendMask
+    // and wakes immediately without a lost-wakeup window for cross-thread Required signals.
+    const uint64_t DeliverablePending = ~SuspendMask & Thread->SignalInfo.PendingSignals;
+    if (DeliverablePending != 0) {
+      Thread->SignalInfo.PendingSignals &= ~DeliverablePending;
+      for (size_t i = 0; i < MAX_SIGNALS; ++i) {
+        if (DeliverablePending & (1ULL << i)) {
+          FHU::Syscalls::tgkill(Thread->ThreadInfo.PID, Thread->ThreadInfo.TID, static_cast<int>(i + 1));
+        }
+      }
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
 
-  // Spin this in a loop until we aren't sigsuspended
-  // This can happen in the case that the guest has sent signal that we can't block
-  uint64_t Result = sigsuspend(&HostSet);
+    const uint64_t HostSuspendMask = MaskToHostSigMask(SuspendMask | GetDeferredSignalsMask(Thread));
+    const long SyscallRet = ::syscall(SYS_rt_sigsuspend, &HostSuspendMask, 8);
+    Result = SyscallRet == -1 ? static_cast<uint64_t>(-errno) : static_cast<uint64_t>(SyscallRet);
+  }
 
-  // Restore Previous signal mask we are emulating
-  // XXX: Might be unsafe if the signal handler adjusted the thread's signal mask
-  // But since we don't support the guest adjusting the mask through the context object
-  // then this is safe-ish
-  Thread->SignalInfo.CurrentSignalMask = Thread->SignalInfo.PreviousSuspendMask;
+  // Re-mask AllSignals in case a guest signal handler ran and rt_sigreturn changed the host
+  // signal mask, then restore the pre-suspend logical mask only if no guest signal handler
+  // interrupted sigsuspend (which clears InSigSuspend and lets rt_sigreturn install the guest
+  // frame's uc_sigmask, including any edits made by the handler).
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+  if (Thread->SignalInfo.InSigSuspend) {
+    Thread->SignalInfo.InSigSuspend = false;
+    Thread->SignalInfo.CurrentSignalMask.Val = SavedPreSuspendMask;
+  }
+  const uint64_t RestoredHostMask = MaskToHostSigMask(Thread->SignalInfo.CurrentSignalMask.Val | GetDeferredSignalsMask(Thread));
+  if (Thread->Thread) {
+    mprotect(reinterpret_cast<void*>(&Thread->Thread->InterruptFaultPage), sizeof(Thread->Thread->InterruptFaultPage),
+             HasDeliverableDeferredSignal(Thread) ? PROT_NONE : (PROT_READ | PROT_WRITE));
+  }
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &RestoredHostMask, nullptr, 8);
 
   CheckForPendingSignals(Thread);
 
-  return Result == -1 ? -errno : Result;
+  return Result;
 }
 
 uint64_t SignalDelegator::GuestSigTimedWait(uint64_t* set, siginfo_t* info, const struct timespec* timeout, size_t sigsetsize) {

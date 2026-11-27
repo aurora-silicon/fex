@@ -5,13 +5,14 @@
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LongJump.h>
+#include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/Threads.h>
 #include <FEXHeaderUtils/Syscalls.h>
 #include <sys/resource.h>
 
 namespace FEX::LinuxEmulation::Threads {
 void* StackTracker::AllocateStackObject() {
-  std::lock_guard lk {DeadStackPoolMutex};
+  auto lk = FEXCore::MaskSignalsAndLockMutex(DeadStackPoolMutex);
   // Keep the first item in the stack pool
   void* Ptr {};
 
@@ -42,18 +43,18 @@ void* StackTracker::AllocateStackObject() {
 }
 
 bool* StackTracker::AddStackToDeadPool(void* Ptr) {
-  std::lock_guard lk {DeadStackPoolMutex};
+  auto lk = FEXCore::MaskSignalsAndLockMutex(DeadStackPoolMutex);
   auto& it = DeadStackPool.emplace_back(DeadStackPoolItem {Ptr, FEX::LinuxEmulation::Threads::STACK_SIZE, false});
   return &it.ReadyToBeReaped;
 }
 
 void StackTracker::AddStackToLivePool(void* Ptr) {
-  std::lock_guard lk {LiveStackPoolMutex};
+  auto lk = FEXCore::MaskSignalsAndLockMutex(LiveStackPoolMutex);
   LiveStackPool.emplace_back(StackPoolItem {Ptr, FEX::LinuxEmulation::Threads::STACK_SIZE});
 }
 
 void StackTracker::RemoveStackFromLivePool(void* Ptr) {
-  std::lock_guard lk {LiveStackPoolMutex};
+  auto lk = FEXCore::MaskSignalsAndLockMutex(LiveStackPoolMutex);
   for (auto it = LiveStackPool.begin(); it != LiveStackPool.end(); ++it) {
     if (it->Ptr == Ptr) {
       LiveStackPool.erase(it);

@@ -555,6 +555,13 @@ namespace DiskCache {
     if (!IsReadingDiskCache()) {
       return std::nullopt;
     }
+
+    auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+    if (RangeInfo.Size == 0 || RangeInfo.Base > GuestRIP || RangeInfo.NeedsInlineSMCChecks) {
+      return std::nullopt;
+    }
+    uint64_t Available = RangeInfo.Base + RangeInfo.Size - GuestRIP;
+
     if (Region && Region->FileStartVA) {
       struct __attribute__((packed)) {
         uint64_t GuestOffset;
@@ -571,7 +578,7 @@ namespace DiskCache {
       XXH3_state_t HashState;
       XXH3_64bits_reset(&HashState);
       for (auto& SubBlock : BlockInfo->Blocks) {
-        if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS) {
+        if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS || SubBlock.ForceFullSMCDetection) {
           return std::nullopt;
         }
         uint64_t HashStart = SubBlock.Entry;
@@ -591,12 +598,6 @@ namespace DiskCache {
       // }
       // LogMan::Msg::IFmt("anon lookup! length {:d} {}", GuestCodeKey, TotalSize);
     }
-
-    auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
-    if (RangeInfo.Size == 0 || RangeInfo.Base > GuestRIP) {
-      return std::nullopt;
-    }
-    uint64_t Available = RangeInfo.Base + RangeInfo.Size - GuestRIP;
 
     uint64_t LookupKey =
       MakeLookupKey(Thread, *GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
@@ -987,6 +988,11 @@ namespace DiskCache {
     if (!DecodedBlockInfo) {
       return false;
     }
+    for (const auto& SubBlock : DecodedBlockInfo->Blocks) {
+      if (SubBlock.ForceFullSMCDetection) {
+        return false;
+      }
+    }
     // check for any reloc targets outside of our jurisdiction
     // todo what are they exactly? caching those blocks is great when it works, so need to figure this out and make finer-grained if we can
     if (RelocationFilter && Region) {
@@ -1184,6 +1190,9 @@ namespace DiskCache {
     memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
 
     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+    if (RangeInfo.Size == 0 || RangeInfo.Base > GuestRIP || RangeInfo.NeedsInlineSMCChecks) {
+      return false;
+    }
     uint64_t LookupKey =
       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
 
@@ -1221,7 +1230,11 @@ namespace DiskCache {
       }
     }
 
-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+    // Copy only the decoded extents: a multiblock can branch over bytes it never decoded, and those need not be readable
+    // (a no-access page between two code pages). Validation compares only the extents; the rest stays zero.
+    for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
+      memcpy(BlobData + GuestCodeOffset + ExactGuestCodeExtents[i], GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
+    }
 
     MesaFOZ::foz_payload_key Key = {};
     {

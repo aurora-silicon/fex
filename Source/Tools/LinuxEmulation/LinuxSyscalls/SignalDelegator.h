@@ -115,6 +115,11 @@ public:
     return reinterpret_cast<uintptr_t>(VDSOPointers.VDSO_FEX_CallbackRET);
   }
 
+  // Asynchronous signals that arrive in JIT or dispatcher code wait for the next check, see HandleGuestSignal.
+  bool NeedsPendingInterruptFaultCheck() const override {
+    return true;
+  }
+
   [[noreturn]]
   void HandleSignalHandlerReturn(bool RT) {
     using SignalHandlerReturnFunc = void (*)();
@@ -145,6 +150,9 @@ public:
   void SaveTelemetry();
 
   void SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask);
+  void FillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask, uint32_t ChangedEFLAGS);
+  void SpillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext);
+  void FillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext);
 
 private:
   enum DefaultBehaviourType {
@@ -219,6 +227,7 @@ private:
 
   bool InstallHostThunk(int Signal);
   bool UpdateHostThunk(int Signal);
+  void InstallOrUpdateRequiredHostThunk(int Signal, bool Required);
 
   bool IsAddressInDispatcher(uint64_t Address) const {
     return Address >= Config.DispatcherBegin && Address < Config.DispatcherEnd;
@@ -257,12 +266,12 @@ private:
     ///< FP state now follows after this.
   };
 
-  void RestoreFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                        FEXCore::Core::CpuStateFrame* Frame, void* ucontext);
-  void RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                         FEXCore::Core::CpuStateFrame* Frame, void* ucontext);
-  void RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                           FEXCore::Core::CpuStateFrame* Frame, void* ucontext);
+  uint64_t RestoreFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
+                            FEXCore::Core::CpuStateFrame* Frame);
+  uint64_t RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
+                             FEXCore::Core::CpuStateFrame* Frame);
+  uint64_t RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
+                               FEXCore::Core::CpuStateFrame* Frame);
 
   ///< Setup the signal frame for x64.
   uint64_t SetupFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* ContextBackup,
@@ -284,14 +293,17 @@ private:
     TYPE_NONREALTIME, ///< Signal restore type is from a `non-realtime` signal.
     TYPE_PAUSE,       ///< Signal restore type is from a GDB pause event.
   };
-  ArchHelpers::Context::ContextBackup* StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext);
+  ArchHelpers::Context::ContextBackup* StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext, bool IsGuestSignal);
   void RestoreThreadState(FEXCore::Core::InternalThreadState* Thread, void* ucontext, RestoreType Type);
   bool HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext,
                                    GuestSigAction* GuestAction, stack_t* GuestStack);
   bool HandleSignalPause(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
   bool HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
 
-  uint64_t GetNewSigMask(int Signal) const;
+  uint64_t GetGuestSignalHandlerMask(int Signal, uint64_t ExistingMask) const;
+  uint64_t MaskToHostSigMask(uint64_t GuestMask) const;
+  uint64_t GetDeferredSignalsMask(const FEX::HLE::ThreadStateObject* ThreadObject) const;
+  bool HasDeliverableDeferredSignal(const FEX::HLE::ThreadStateObject* ThreadObject) const;
 };
 
 fextl::unique_ptr<FEX::HLE::SignalDelegator>

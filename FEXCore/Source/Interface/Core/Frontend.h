@@ -23,6 +23,8 @@ class ContextImpl;
 namespace FEXCore::Frontend {
 class Decoder final {
 public:
+  static constexpr size_t MAX_INST_SIZE = 15;
+
   enum class DecodedBlockStatus {
     SUCCESS,
     INVALID_INST,
@@ -67,7 +69,9 @@ public:
   Decoder(FEXCore::Core::InternalThreadState* Thread);
   bool CheckIfCacheable(FEXCore::Core::InternalThreadState&, const uint8_t* InstStream, uint64_t PC, uint64_t MaxInst);
 
-  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst);
+  // Protect: write-protect each page the block decodes from before reading it, for blocks whose pages get added to the
+  // lookup cache.
+  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect = false);
   void DecodeLoop(const uint8_t* InstStream, uint64_t GuestPause = 0);
 
   const DecodedBlockInformation* GetDecodedBlockInfo() const {
@@ -124,6 +128,9 @@ private:
   // Negative: Number of bytes that failed to decode.
   int32_t CheckRangeExecutable(uint64_t Address, uint64_t Size);
 
+  void ProtectCodePage(uint64_t Page);
+  void RecordCodePage(uint64_t Page);
+
   uint8_t ReadByte();
   std::optional<uint8_t> PeekByte(uint8_t Offset);
   std::pair<uint64_t, bool> ReadData(uint8_t Size);
@@ -142,7 +149,10 @@ private:
   Utils::PoolBufferWithTimedRetirement<FEXCore::X86Tables::DecodedInst*, 5000, 500> PoolObject;
   size_t DecodedSize {};
   uint64_t TotalInstructions {};
-  uint64_t CurrentCodePage {};
+  uint64_t CurrentCodePage {~0ULL};
+  uint64_t LastRecordedCodePage {~0ULL};
+  bool ProtectCodePages {};
+  fextl::set<uint64_t> ProtectedCodePages;
   bool EntryBlock {};
   bool FinalInstruction {};
   uint64_t MaxInst {};
@@ -190,7 +200,6 @@ private:
     return BlockInfo.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
   }
 
-  static constexpr size_t MAX_INST_SIZE = 15;
   uint8_t InstructionSize {};
   // Contains the full decoded instruction, unless it is a `Thunk` instruction.
   std::array<uint8_t, MAX_INST_SIZE> Instruction;

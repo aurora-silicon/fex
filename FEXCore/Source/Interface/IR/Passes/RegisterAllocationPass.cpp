@@ -381,7 +381,8 @@ private:
   }
 
   // Assign a register for a given Node, spilling if necessary.
-  void AssignReg(IROp_Header* IROp, IROp_CodeBlock* Block, Ref CodeNode, IROp_Header* Pivot) {
+  // Returns true if a spill instruction was inserted before CodeNode.
+  bool AssignReg(IROp_Header* IROp, IROp_CodeBlock* Block, Ref CodeNode, IROp_Header* Pivot) {
     const uint32_t Node = IR->GetID(CodeNode).Value;
 
     // Prioritize preferred registers.
@@ -392,7 +393,7 @@ private:
 
         if ((Class->Available & RegBits) == RegBits) {
           SetReg(CodeNode, Reg);
-          return;
+          return false;
         }
       }
     }
@@ -405,7 +406,7 @@ private:
 
       if (Reg.AsRegClass() != RegClass::GPRFixed && Reg.AsRegClass() != RegClass::FPRFixed && (Class->Available & RegBits) == RegBits) {
         SetReg(CodeNode, Reg);
-        return;
+        return false;
       }
     }
 
@@ -423,14 +424,14 @@ private:
       if (Available) {
         unsigned Reg = std::countr_zero(Available);
         SetReg(CodeNode, PhysicalRegister(RegClass::GPR, Reg));
-        return;
+        return false;
       }
     } else if (IROp->Op == OP_ALLOCATEGPRAFTER) {
       uint32_t Available = Classes[FEXCore::ToUnderlying(RegClass::GPR)].Available;
       auto After = PhysicalRegister(IROp->Args[0]);
       if ((After.Reg & 1) == 0 && Available & (1ull << (After.Reg + 1))) {
         SetReg(CodeNode, PhysicalRegister(RegClass::GPR, After.Reg + 1));
-        return;
+        return false;
       }
     }
 
@@ -438,15 +439,18 @@ private:
     RegisterClassData* Class = &Classes[FEXCore::ToUnderlying(ClassType)];
 
     // Spill to make room in the register file.
+    bool Spilled = false;
     if (!Class->Available) {
       IREmit->SetWriteCursorBefore(CodeNode);
       SpillReg(Class, Block, Pivot);
+      Spilled = true;
     }
 
     // Assign a free register in the appropriate class.
     LOGMAN_THROW_A_FMT(Class->Available != 0, "Post-condition of spilling");
     unsigned Reg = std::countr_zero(Class->Available);
     SetReg(CodeNode, PhysicalRegister(ClassType, Reg));
+    return Spilled;
   }
 };
 
@@ -467,7 +471,9 @@ static bool KillMove(const IROp_Header* LastOp, IROp_Header* IROp, Ref LastNode,
       IROp->Size = OpSize::i32Bit;
       return true;
     } else if (IROp->Size == OpSize::i32Bit) {
-      return Op == OP_OR || Op == OP_XOR || Op == OP_AND || Op == OP_SUB || Op == OP_LSHL || Op == OP_LSHR || Op == OP_ASHR;
+      return Op == OP_ADD || Op == OP_ADDWITHFLAGS || Op == OP_SUB || Op == OP_SUBWITHFLAGS || Op == OP_OR || Op == OP_XOR ||
+             Op == OP_AND || Op == OP_ANDWITHFLAGS || Op == OP_ANDN || Op == OP_MUL || Op == OP_UMUL || Op == OP_ADDSHIFT ||
+             Op == OP_SUBSHIFT || Op == OP_LSHL || Op == OP_LSHR || Op == OP_ASHR || Op == OP_ROR;
     }
   }
 
@@ -754,7 +760,9 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
 
       // Assign destinations.
       if (GetHasDest(IROp->Op) && PhysicalRegister(CodeNode).IsInvalid()) {
-        AssignReg(IROp, BlockIROp, CodeNode, IROp);
+        if (AssignReg(IROp, BlockIROp, CodeNode, IROp)) {
+          LastNode = nullptr;
+        }
       }
 
       if (IsTrivial(CodeNode, IROp)) {

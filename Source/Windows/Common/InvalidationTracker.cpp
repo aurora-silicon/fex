@@ -55,6 +55,30 @@ static bool IsInlineSMCCheckSection(const IMAGE_SECTION_HEADER& Section) {
   return Name == ".themida";
 }
 
+bool InvalidationTracker::InsertIfExecutableLocked(FEXCore::IntervalList<uint64_t>::Interval ProtInterval, ULONG Prot) {
+  const bool HasExec = ProtHasExec(Prot);
+  const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
+  const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+
+  if (!EffectiveExec) {
+    return false;
+  }
+
+  XIntervals.Insert(ProtInterval);
+  if (EffectiveRWX) {
+    LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", ProtInterval.Offset, ProtInterval.End);
+    RWXIntervals.Insert(ProtInterval);
+  } else {
+    RWXIntervals.Remove(ProtInterval);
+  }
+  if (DEPDisabled && !HasExec) {
+    DEPPromotedIntervals.Insert(ProtInterval);
+  } else {
+    DEPPromotedIntervals.Remove(ProtInterval);
+  }
+  return true;
+}
+
 void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
@@ -64,21 +88,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
 
     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
 
-    const bool HasExec = ProtHasExec(Prot);
-    const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
-    const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
-
-    if (EffectiveExec) {
-      XIntervals.Insert(ProtInterval);
-      if (EffectiveRWX) {
-        LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
-        RWXIntervals.Insert(ProtInterval);
-      } else {
-        RWXIntervals.Remove(ProtInterval);
-      }
-      if (DEPDisabled && !HasExec) {
-        DEPPromotedIntervals.Insert(ProtInterval);
-      }
+    if (InsertIfExecutableLocked(ProtInterval, Prot)) {
       return true;
     } else if (XIntervals.Intersect(ProtInterval)) {
       XIntervals.Remove(ProtInterval);
@@ -203,16 +213,34 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     SectionSize += Info.RegionSize;
   }
 
-  InvalidateIntervalInternal(SectionBase, SectionSize);
-
+  // Drop the intervals before invalidating and under the same lock, so a racing compile can't cache code from the range
+  // once it has been invalidated. Until EndSectionUnmap, QueryExecutableRange must not learn the view again either.
+  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
     InlineSMCIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    DEPPromotedIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    UnmappingSection = {SectionBase, SectionBase + SectionSize};
   }
+  InvalidateIntervalInternalLocked(SectionBase, SectionSize);
 
   return {SectionBase, SectionSize};
+}
+
+void InvalidationTracker::EndSectionUnmap() {
+  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+  FEXCore::IntervalList<uint64_t>::Interval Section;
+  {
+    std::unique_lock Lock(IntervalsLock);
+    Section = std::exchange(UnmappingSection, {});
+  }
+  // Drop the NoExec blocks compiled while the view was refused: they are wrong for whatever is mapped here next,
+  // and for the view itself if the unmap failed.
+  if (Section.End != Section.Offset) {
+    InvalidateIntervalInternalLocked(Section.Offset, Section.End - Section.Offset);
+  }
 }
 
 void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
@@ -224,14 +252,16 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
 
-  InvalidateIntervalInternal(AlignedBase, AlignedSize);
-
+  // Drop the intervals before invalidating and under the same lock, so a racing compile can't cache code from the range.
+  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     InlineSMCIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    DEPPromotedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }
+  InvalidateIntervalInternalLocked(AlignedBase, AlignedSize);
 }
 
 void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size) {
@@ -271,7 +301,40 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
 }
 
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
+  {
+    std::shared_lock Lock(IntervalsLock);
+    if (XIntervals.Query(Address).Enclosed) {
+      return QueryExecutableRangeLocked(Address);
+    }
+  }
+
+  // Mapping a view of a non-image section raises no protection notification, so an executable view (for example
+  // code written through a second, writable view of the same section) is learnt from its page protection here.
+  // Query under the lock: a protection change notifies under it after changing the pages, so it can't be lost in between.
+  // A view that is being unmapped is still visible here, so it is refused until EndSectionUnmap.
+  // A guard page is refused so the decoder never trips the guard itself; the guest's fetch faults instead.
+  // Writes through another, non-executable view of the section are not seen by SMC detection.
+  std::unique_lock Lock(IntervalsLock);
+  if (XIntervals.Query(Address).Enclosed) {
+    return QueryExecutableRangeLocked(Address);
+  }
+  if (Address >= UnmappingSection.Offset && Address < UnmappingSection.End) {
+    return {};
+  }
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info)) || Info.State != MEM_COMMIT || Info.Type != MEM_MAPPED ||
+      (Info.Protect & PAGE_GUARD)) {
+    return {};
+  }
+
+  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  if (!InsertIfExecutableLocked({Base, Base + Info.RegionSize}, Info.Protect)) {
+    return {};
+  }
+  return QueryExecutableRangeLocked(Address);
+}
+
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
     return {};

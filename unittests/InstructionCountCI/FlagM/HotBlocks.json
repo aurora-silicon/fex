@@ -10,7 +10,7 @@
       "SVE256",
       "AFP"
     ],
-    "BinaryCacheVersion": 44
+    "BinaryCacheVersion": 46
   },
   "Instructions": {
     "The Witcher 3": {
@@ -475,7 +475,7 @@
     },
     "000000000020e9bd <DoNNetIteration+0x21d>:": {
       "x86InstructionCount": 35,
-      "ExpectedInstructionCount": 53,
+      "ExpectedInstructionCount": 52,
       "x86Insts": [
         "mov    rsi,0xfffffffffffffee8",
         "xchg   ax,ax",
@@ -547,8 +547,7 @@
         "movk w20, #0x1, lsl #16",
         "mul w11, w11, w20",
         "sub w5, w5, w11",
-        "mov w11, w5",
-        "negs w11, w11",
+        "negs w11, w5",
         "csel w11, w5, w11, mi",
         "movi v16.2d, #0x0",
         "scvtf d0, x11",

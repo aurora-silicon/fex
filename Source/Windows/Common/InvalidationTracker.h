@@ -30,7 +30,9 @@ public:
     uint64_t SectionStart;
     uint64_t SectionSize;
   };
+  // With Free set, the section is being unmapped: call EndSectionUnmap once the unmap has returned.
   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
+  void EndSectionUnmap();
   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
   bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
@@ -42,6 +44,13 @@ public:
   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
 
 private:
+  // QueryExecutableRange with IntervalsLock held.
+  FEXCore::HLE::ExecutableRangeInfo QueryExecutableRangeLocked(uint64_t Address);
+
+  // Inserts Interval with the protection Prot if that makes it executable, returns false otherwise.
+  // NOTE: Must be called with IntervalsLock held.
+  bool InsertIfExecutableLocked(FEXCore::IntervalList<uint64_t>::Interval ProtInterval, ULONG Prot);
+
   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
   void DisableSMCDetection();
   void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
@@ -72,6 +81,8 @@ private:
   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
   bool DEPDisabled {false};                             // Protected by IntervalsLock
   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+  // The section an in-flight NtUnmapViewOfSection removes; callers serialise unmaps. Protected by IntervalsLock
+  FEXCore::IntervalList<uint64_t>::Interval UnmappingSection {};
 
   bool MonoBackpatcherDetectionPending {false};
   uint64_t MonoBase {0};

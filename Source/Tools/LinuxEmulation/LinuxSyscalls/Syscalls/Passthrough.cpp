@@ -14,6 +14,7 @@ $end_info$
 #include <array>
 #include <errno.h>
 #include <linux/io_uring.h>
+#include <linux/userfaultfd.h>
 #include <stdint.h>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -506,7 +507,12 @@ namespace x64 {
       REGISTER_SYSCALL_IMPL_X64(io_uring_register, SyscallPassthrough4<SYSCALL_DEF(io_uring_register)>);
     }
     REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
-    REGISTER_SYSCALL_IMPL_X64(ioctl, SyscallPassthrough3<SYSCALL_DEF(ioctl)>);
+    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame* Frame, int fd, uint64_t request, uint64_t args) -> uint64_t {
+      if (_IOC_TYPE(request) == UFFDIO) [[unlikely]] {
+        return FEX::HLE::UserfaultfdIoctl(fd, request, args);
+      }
+      return SyscallPassthrough3<SYSCALL_DEF(ioctl)>(Frame, fd, request, args);
+    });
     REGISTER_SYSCALL_IMPL_X64(pread_64, SyscallPassthrough4<SYSCALL_DEF(pread_64)>);
     REGISTER_SYSCALL_IMPL_X64(pwrite_64, SyscallPassthrough4<SYSCALL_DEF(pwrite_64)>);
     REGISTER_SYSCALL_IMPL_X64(readv, SyscallPassthrough3<SYSCALL_DEF(readv)>);

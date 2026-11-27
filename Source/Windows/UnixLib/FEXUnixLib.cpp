@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
+#ifdef __aarch64__
+#include <sys/auxv.h>
+#endif
 #include <sys/prctl.h>
 #include <unistd.h>
 
@@ -47,6 +51,16 @@ constexpr NTSTATUS STATUS_INTERNAL_ERROR = 0xC00000E5;
 
 #ifndef PR_GET_TPIDRRO_CPU
 #define PR_GET_TPIDRRO_CPU 0x7F1DBB0
+#endif
+
+#ifndef AT_HWCAP3
+#define AT_HWCAP3 29
+#endif
+#ifndef HWCAP3_APPLE_APFLG
+#define HWCAP3_APPLE_APFLG (1UL << 63)
+#endif
+#ifndef PR_AURORA_SET_X86_FLAGS
+#define PR_AURORA_SET_X86_FLAGS 0x41555006
 #endif
 
 static NTSTATUS FEXUnixLib_SetHardwareTSOControlHandler(void* _Args) {
@@ -181,6 +195,15 @@ static NTSTATUS FEXUnixLib_MapFileHandler(void* _Args) {
 }
 
 static NTSTATUS FEXUnixLib_GetPIDHandler(void* _Args) {
+  uint32_t Magic {};
+  std::memcpy(&Magic, _Args, sizeof(Magic));
+  if (Magic == FEX_UNIXLIB_QUERY_MAGIC) {
+    auto Query = reinterpret_cast<FEXUnixLib_GetPIDQuery*>(_Args);
+    Query->Result = ::getpid();
+    Query->MaxFunction = ToUnderlying(FEXUnixLibFunctions::MAX);
+    return STATUS_SUCCESS;
+  }
+
   auto Args = reinterpret_cast<FEXUnixLib_GetPID*>(_Args);
   Args->Result = ::getpid();
   return STATUS_SUCCESS;
@@ -190,6 +213,37 @@ static NTSTATUS FEXUnixLib_CheckSupportsTPIDRRO_CPUHandler(void* _Args) {
   auto Args = reinterpret_cast<FEXUnixLib_CheckSupportsTPIDRRO_CPU*>(_Args);
   Args->Result = prctl(PR_GET_TPIDRRO_CPU, 0, 0, 0, 0);
   return STATUS_SUCCESS;
+}
+
+static NTSTATUS FEXUnixLib_EnableAPFLGHandler(void*) {
+#ifdef __aarch64__
+  if (!(getauxval(AT_HWCAP3) & HWCAP3_APPLE_APFLG)) {
+    return STATUS_NOT_SUPPORTED;
+  }
+  return prctl(PR_AURORA_SET_X86_FLAGS, 1, 0, 0, 0) == 0 ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+#else
+  return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+static NTSTATUS FEXUnixLib_SetAPFLGControlHandler(void* _Args) {
+#ifdef __aarch64__
+  if (!_Args) {
+    return STATUS_NOT_SUPPORTED;
+  }
+  auto Args = reinterpret_cast<const FEXUnixLib_SetAPFLGControlArgs*>(_Args);
+  if (Args->Enable) {
+    if (!(getauxval(AT_HWCAP3) & HWCAP3_APPLE_APFLG)) {
+      return STATUS_NOT_SUPPORTED;
+    }
+    return prctl(PR_AURORA_SET_X86_FLAGS, 1, 0, 0, 0) == 0 ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+  }
+
+  return prctl(PR_AURORA_SET_X86_FLAGS, 0, 0, 0, 0) == 0 ? STATUS_SUCCESS : STATUS_INTERNAL_ERROR;
+#else
+  (void)_Args;
+  return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
@@ -202,6 +256,8 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
   FEXUnixLib_MapFileHandler,
   FEXUnixLib_GetPIDHandler,
   FEXUnixLib_CheckSupportsTPIDRRO_CPUHandler,
+  FEXUnixLib_EnableAPFLGHandler,
+  FEXUnixLib_SetAPFLGControlHandler,
 };
 
 static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));

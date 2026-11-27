@@ -742,7 +742,9 @@ uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args
 };
 
 uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Addr) {
-  std::lock_guard<std::mutex> lk(MMapMutex);
+  // Defer signals before taking MMapMutex: GuestMunmap/GuestMmap below nest deferred signal sections,
+  // and without an outer defer guard any async signal deferred there would fire while MMapMutex is held.
+  auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(MMapMutex, Frame->Thread);
 
   uint64_t Result;
 
@@ -824,6 +826,10 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   HostKernelVersion = LinuxVersion::CalculateHostKernelVersion();
   GuestKernelVersion = CalculateGuestKernelVersion();
   Alloc32Handler = FEX::HLE::Create32BitAllocator();
+
+  if (SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK) {
+    InlineSMCIntervals.Reserve(INLINE_SMC_INITIAL_INTERVAL_CAPACITY);
+  }
 
   SignalDelegation->RegisterHostSignalHandler(SIGSEGV, HandleSegfault, true);
 
@@ -965,7 +971,7 @@ void SyscallHandler::LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) 
   while (true) {
     TM.LockBeforeFork();
     Thread->CTX->LockBeforeFork(Thread);
-    if (std::try_lock(CodeCachePatchingMutex, VMATracking.Mutex) == -1) {
+    if (std::try_lock(CodeCachePatchingMutex, VMATracking.Mutex, InlineSMCMutex) == -1) {
       break;
     }
 
@@ -982,9 +988,11 @@ void SyscallHandler::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThr
     // Code maps are closed upon fork in the child
     FM.SetProtectedCodeMapFD(-1);
 
+    InlineSMCMutex.StealAndDropActiveLocks();
     VMATracking.Mutex.StealAndDropActiveLocks();
     CodeCachePatchingMutex.StealAndDropActiveLocks();
   } else {
+    InlineSMCMutex.unlock();
     VMATracking.Mutex.unlock();
     CodeCachePatchingMutex.unlock();
   }

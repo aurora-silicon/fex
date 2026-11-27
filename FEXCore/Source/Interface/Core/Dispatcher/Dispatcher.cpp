@@ -222,11 +222,12 @@ void Dispatcher::EmitDispatcher() {
       // If we've made it here then we have a real compiled block
       {
         // update L1 cache
-        ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
-
-        // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-        // L1Mask is pre-shifted.
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        // Calculate (L1Pointer + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address.
+        // L1Mask is pre-shifted; TMP3 (RipReg) and TMP4 (HostCode) are live across this update.
+        eor(ARMEmitter::Size::i64Bit, TMP1, RipReg.R(), RipReg.R(), ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+        ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
         add(TMP1, TMP1, TMP2);
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
@@ -249,6 +250,19 @@ void Dispatcher::EmitDispatcher() {
     // LR is set to the correct return location now
     ret();
   }
+
+  [[maybe_unused]] auto EmitPendingInterruptFaultCheck = [&]() {
+    // Trigger segfault if any deferred signals are pending
+    constexpr size_t InterruptPageOffset =
+      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+    if constexpr (InterruptPageOffset <= 32760) {
+      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
+    } else {
+      // Need to use vector 128-bit store for this range.
+      // Doesn't matter which register we use to store.
+      str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
+    }
+  };
 
   // Clobbers TMP1/2
   auto EmitSignalGuardedRegion = [&](auto Body) {
@@ -276,16 +290,7 @@ void Dispatcher::EmitDispatcher() {
     sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
 
-    // Trigger segfault if any deferred signals are pending
-    constexpr size_t InterruptPageOffset =
-      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
-    if constexpr (InterruptPageOffset <= 32760) {
-      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
-    } else {
-      // Need to use vector 128-bit store for this range.
-      // Doesn't matter which register we use to store.
-      str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
-    }
+    EmitPendingInterruptFaultCheck();
 #endif
   };
 
@@ -510,6 +515,14 @@ void Dispatcher::EmitDispatcher() {
     // First thing we need to move the thread state pointer back in to our register
     mov(STATE, ARMEmitter::XReg::x0);
 
+    // Save the enclosing thunk's InSyscallInfo on the 16-byte aligned host stack and clear it before
+    // mutating guest state or filling static registers. Because CallbackPtr executes in the dispatcher,
+    // clearing InSyscallInfo enables BetweenChecks deferral for async signals until the callback enters
+    // JIT code, while CallbackReturn restores the saved value before returning to the host thunk.
+    ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, InSyscallInfo));
+    stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::x2, ARMEmitter::XReg::zr, ARMEmitter::Reg::rsp, -16);
+    str(ARMEmitter::XReg::zr, STATE_PTR(CpuStateFrame, InSyscallInfo));
+
     // Make sure to adjust the refcounter so we don't clear the cache now
     ldr(ARMEmitter::WReg::w2, STATE_PTR(CpuStateFrame, SignalHandlerRefCounter));
     add(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::r2, 1);
@@ -555,9 +568,10 @@ void Dispatcher::EmitDispatcher() {
       add(ARMEmitter::Size::i64Bit, TMP3, TMP3, rip_offset);
     }
 
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(tmp3) & L1_ENTRIES_MASK) << 4)) for the address
     // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    eor(ARMEmitter::Size::i64Bit, TMP4, TMP3, TMP3, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
     add(TMP1, TMP1, TMP2);
 
     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
@@ -577,6 +591,12 @@ void Dispatcher::EmitDispatcher() {
     // This gives the signal handler a value to check to see if we are in a syscall at all
     LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0xFFFF);
     str(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+    if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+      // Take pending signals before the syscall, which may block. Signals that arrive from here on are taken right away, as
+      // the thread is marked as in a syscall. The guest state is all in the frame.
+      EmitPendingInterruptFaultCheck();
+    }
 
     ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerObj));
     ldr(ARMEmitter::XReg::x3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerFunc));

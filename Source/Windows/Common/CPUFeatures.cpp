@@ -2,16 +2,59 @@
 
 #include "Common/CPUInfo.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/fextl/fmt.h>
 
+#include <atomic>
 #include <windows.h>
 
 #include "CPUFeatures.h"
 #include "FEXUnixLib.h"
 
 namespace {
+
+struct WineAPFLGExceptionProbeState {
+  uintptr_t FaultPc {};
+  uintptr_t ResumePc {};
+  uintptr_t FailPc {};
+  uint32_t ExpectedBits {};
+  bool Handled {};
+  uint32_t CapturedCpsr {};
+};
+
+// Use a Win32 TLS slot backed directly by TEB->TlsSlots rather than C++ thread_local:
+// FEX's Windows DLLs link with -nostdlib/-nostartfiles and no IMAGE_TLS_DIRECTORY (_tls_used),
+// so implicit .tls accesses through TEB->ThreadLocalStoragePointer are uninitialized.
+std::atomic<DWORD> ActiveAPFLGProbeTlsSlot {TLS_OUT_OF_INDEXES};
+
+DWORD GetOrAllocAPFLGProbeTlsSlot() {
+  DWORD Slot = ActiveAPFLGProbeTlsSlot.load(std::memory_order_acquire);
+  if (Slot != TLS_OUT_OF_INDEXES) {
+    return Slot;
+  }
+
+  const DWORD NewSlot = TlsAlloc();
+  if (NewSlot == TLS_OUT_OF_INDEXES) {
+    return TLS_OUT_OF_INDEXES;
+  }
+
+  DWORD Expected = TLS_OUT_OF_INDEXES;
+  if (!ActiveAPFLGProbeTlsSlot.compare_exchange_strong(Expected, NewSlot, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    TlsFree(NewSlot);
+    return Expected;
+  }
+
+  return NewSlot;
+}
+
+struct ScopedAPFLGProbeSlot {
+  DWORD Slot;
+  ~ScopedAPFLGProbeSlot() {
+    TlsSetValue(Slot, nullptr);
+  }
+};
 
 HKEY OpenProcessorKey(uint32_t Idx) {
   HKEY Out;
@@ -57,7 +100,8 @@ public:
   }
 };
 
-FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostFeatures::HostTypeEnum HostType, uint32_t ProcessPID) {
+FEXCore::HostFeatures
+CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostFeatures::HostTypeEnum HostType, uint32_t ProcessPID, bool (*CheckWineAPFLGCPSR)()) {
   HKEY Key = OpenProcessorKey(0);
   if (!Key) {
     ERROR_AND_DIE_FMT("Couldn't detect CPU features");
@@ -84,6 +128,20 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
 
   HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine || FEX::Windows::UnixLib::SupportsTPIDRRO_CPU();
 
+  FEX_CONFIG_OPT(HostFeaturesOpt, HOSTFEATURES);
+  const bool DisableAPFLG = (HostFeaturesOpt() & FEXCore::Config::HostFeatures::DISABLEAPFLG) != 0;
+  HostFeatures.SupportsAPFLG = false;
+  if (IsWine && !DisableAPFLG && HostFeatures.SupportsFlagM && CheckWineAPFLGCPSR && FEX::Windows::UnixLib::TryEnableAPFLG()) {
+    if (CheckWineAPFLGCPSR()) {
+      HostFeatures.SupportsAPFLG = true;
+    } else {
+      LogMan::Msg::IFmt("FEX: Wine does not preserve APFLG NZCV bits across context recovery; disabling APFLG");
+      if (!FEX::Windows::UnixLib::DisableAPFLG()) {
+        ERROR_AND_DIE_FMT("FEX: Failed to disable hardware APFLG after Wine CPSR probe failure");
+      }
+    }
+  }
+
   HostFeatures.ProcessPID = ProcessPID;
 
   // AVX is unsupported for WOW64
@@ -97,7 +155,85 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   return HostFeatures;
 }
 
-CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX) {
+bool CPUFeatures::HandleAPFLGProbeException(const EXCEPTION_RECORD* Exception, ARM64_NT_CONTEXT* NativeContext,
+                                            NTSTATUS (*ContinueFn)(ARM64_NT_CONTEXT*, BOOLEAN)) {
+  const DWORD Slot = ActiveAPFLGProbeTlsSlot.load(std::memory_order_acquire);
+  if (Slot == TLS_OUT_OF_INDEXES || !Exception || !NativeContext || !ContinueFn) {
+    return false;
+  }
+
+  auto* Probe = static_cast<WineAPFLGExceptionProbeState*>(TlsGetValue(Slot));
+  if (!Probe) {
+    return false;
+  }
+
+  if (Exception->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION || Probe->FaultPc == 0 || Probe->ResumePc == 0 || Probe->FailPc == 0 ||
+      NativeContext->Pc != Probe->FaultPc) {
+    return false;
+  }
+
+  Probe->CapturedCpsr = NativeContext->Cpsr;
+  Probe->Handled = true;
+  NativeContext->Cpsr |= Probe->ExpectedBits;
+  NativeContext->Pc = Probe->ResumePc;
+
+  __asm volatile("msr nzcv, xzr" ::: "cc");
+  ContinueFn(NativeContext, FALSE);
+
+  // If ContinueFn returned an error instead of transferring control with the probe bits
+  // set in Cpsr, clear the probe bits and redirect to the probe failure label so the
+  // probe returns false cleanly rather than letting the synthetic SIGILL escape.
+  Probe->Handled = false;
+  NativeContext->Cpsr &= ~Probe->ExpectedBits;
+  NativeContext->Pc = Probe->FailPc;
+  ContinueFn(NativeContext, FALSE);
+  ERROR_AND_DIE_FMT("FEX: Failed to resume after Wine APFLG CPSR probe exception");
+}
+
+__attribute__((noinline)) bool CPUFeatures::ProbeWineAPFLGExceptionRoundTrip() {
+  const DWORD Slot = GetOrAllocAPFLGProbeTlsSlot();
+  if (Slot == TLS_OUT_OF_INDEXES || TlsGetValue(Slot) != nullptr) {
+    return false;
+  }
+
+  static constexpr uint32_t APFLGBits = (1U << 26) | (1U << 27);
+  WineAPFLGExceptionProbeState Probe {
+    .ExpectedBits = APFLGBits,
+  };
+  if (!TlsSetValue(Slot, &Probe)) {
+    return false;
+  }
+  ScopedAPFLGProbeSlot Guard {Slot};
+
+  uint64_t OutNZCV = 0;
+  uint64_t Resumed = 0;
+  asm volatile(
+    "adr x9, 1f\n\t"
+    "str x9, %[FaultPc]\n\t"
+    "adr x9, 2f\n\t"
+    "str x9, %[ResumePc]\n\t"
+    "adr x9, 4f\n\t"
+    "str x9, %[FailPc]\n\t"
+    "msr nzcv, %x[Bits]\n\t"
+    "1:\n\t"
+    "udf #0\n\t"
+    "4:\n\t"
+    "mov %x[Resumed], #0\n\t"
+    "mov %x[Out], #0\n\t"
+    "b 3f\n\t"
+    "2:\n\t"
+    "mrs %x[Out], nzcv\n\t"
+    "mov %x[Resumed], #1\n\t"
+    "3:\n\t"
+    : [FaultPc] "=m"(Probe.FaultPc), [ResumePc] "=m"(Probe.ResumePc), [FailPc] "=m"(Probe.FailPc), [Out] "=&r"(OutNZCV), [Resumed] "=&r"(Resumed)
+    : [Bits] "r"(static_cast<uint64_t>(APFLGBits))
+    : "x9", "cc", "memory");
+
+  return Probe.Handled && Resumed == 1 && (Probe.CapturedCpsr & APFLGBits) == APFLGBits && (OutNZCV & APFLGBits) == APFLGBits;
+}
+
+CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX, bool SupportsAPFLG)
+  : SupportsAPFLG {SupportsAPFLG} {
 #ifdef ARCHITECTURE_arm64ec
   // Report as a 64-bit host for ARM64EC.
   CpuInfo.ProcessorArchitecture = PROCESSOR_ARCHITECTURE_AMD64;
@@ -136,6 +272,12 @@ CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX) {
   CpuInfo.ProcessorRevision |= FamilyIdentifier & 0xf;                                          // Stepping
   // 8-bits in CPUID 01.ebx for up to 256 cores.
   CpuInfo.MaximumProcessors = ((CPUIDResult01.ebx >> 16) & 0xFF) + 1;
+}
+
+void CPUFeatures::EnableAPFLGForCurrentThread() const {
+  if (SupportsAPFLG && !FEX::Windows::UnixLib::TryEnableAPFLG()) {
+    ERROR_AND_DIE_FMT("FEX: Failed to enable hardware APFLG on JIT thread");
+  }
 }
 
 bool CPUFeatures::IsFeaturePresent(uint32_t Feature) {

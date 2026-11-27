@@ -80,5 +80,22 @@ FEX_DEFAULT_VISIBILITY fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(s
 FEX_DEFAULT_VISIBILITY void RegisterTLSData(FEXCore::Core::InternalThreadState* Thread);
 FEX_DEFAULT_VISIBILITY void UninstallTLSData(FEXCore::Core::InternalThreadState* Thread);
 FEX_DEFAULT_VISIBILITY bool TryGrowMainThreadStack(uintptr_t FaultAddress);
+
+// Temporarily clears the allocator's per-thread deferred-signal state so OSAllocator_64Bit
+// falls back to signal masking instead of writing InterruptFaultPage while signals (including
+// SIGSEGV) are masked.
+class FEX_DEFAULT_VISIBILITY ScopedDisableAllocatorDeferredSignals final {
+public:
+  ScopedDisableAllocatorDeferredSignals();
+  ~ScopedDisableAllocatorDeferredSignals();
+  ScopedDisableAllocatorDeferredSignals(const ScopedDisableAllocatorDeferredSignals&) = delete;
+  ScopedDisableAllocatorDeferredSignals& operator=(const ScopedDisableAllocatorDeferredSignals&) = delete;
+  ScopedDisableAllocatorDeferredSignals(ScopedDisableAllocatorDeferredSignals&& rhs) noexcept;
+  ScopedDisableAllocatorDeferredSignals& operator=(ScopedDisableAllocatorDeferredSignals&&) = delete;
+
+private:
+  FEXCore::Core::InternalThreadState* SavedThread {};
+  bool Active {};
+};
 #endif
 } // namespace FEXCore::Allocator

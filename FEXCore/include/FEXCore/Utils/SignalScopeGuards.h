@@ -2,6 +2,9 @@
 #pragma once
 
 #include <FEXCore/Debug/InternalThreadState.h>
+#ifndef _WIN32
+#include <FEXCore/Utils/Allocator.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -159,23 +162,31 @@ public:
     : OriginalMask(0) {
     // Mask all signals, storing the original incoming mask
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &*OriginalMask, sizeof(*OriginalMask));
+    // While signals (including SIGSEGV) are masked, OSAllocator_64Bit must not touch
+    // InterruptFaultPage via DeferredSignalRefCountGuard (which would kill the process if
+    // InterruptFaultPage is PROT_NONE).
+    DisableAllocatorDeferredSignals.emplace();
   }
 
   // Move-only type
   ScopedSignalMasker(const ScopedSignalMasker&) = delete;
   ScopedSignalMasker& operator=(ScopedSignalMasker&) = delete;
   ScopedSignalMasker(ScopedSignalMasker&& rhs)
-    : OriginalMask(rhs.OriginalMask) {
+    : OriginalMask(rhs.OriginalMask)
+    , DisableAllocatorDeferredSignals(std::move(rhs.DisableAllocatorDeferredSignals)) {
     rhs.OriginalMask.reset();
+    rhs.DisableAllocatorDeferredSignals.reset();
   }
 
   ~ScopedSignalMasker() {
+    DisableAllocatorDeferredSignals.reset();
     if (OriginalMask) {
-      ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &OriginalMask, nullptr, sizeof(*OriginalMask));
+      ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &*OriginalMask, nullptr, sizeof(*OriginalMask));
     }
   }
 private:
   std::optional<uint64_t> OriginalMask {};
+  std::optional<FEXCore::Allocator::ScopedDisableAllocatorDeferredSignals> DisableAllocatorDeferredSignals {};
 };
 
 /**

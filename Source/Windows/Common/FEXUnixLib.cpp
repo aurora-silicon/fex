@@ -21,6 +21,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace FEX::Windows::UnixLib {
 static bool SupportsVirtualName {true};
+static uint32_t MaxFunctionCount {};
 unixlib_handle_t UnixLibHandle {};
 
 decltype(__wine_unix_call_dispatcher) UnixCallDispatcher {};
@@ -44,6 +45,9 @@ static NTSTATUS __attribute__((naked)) TrampolineCall(unixlib_handle_t, unsigned
 }
 #endif
 bool Init(HMODULE NtDll) {
+  UnixLibHandle = 0;
+  MaxFunctionCount = 0;
+
   const auto Sym = GetProcAddress(NtDll, "__wine_unix_call_dispatcher");
   WineServerHandleToFd = reinterpret_cast<wine_server_handle_to_fd_t>(GetProcAddress(NtDll, "wine_server_handle_to_fd"));
 
@@ -87,6 +91,17 @@ bool Init(HMODULE NtDll) {
   UnixCallDispatcher = *reinterpret_cast<decltype(__wine_unix_call_dispatcher)*>(Sym);
 #endif
 
+  FEXUnixLib_GetPIDQuery Query {
+    .Result = FEX_UNIXLIB_QUERY_MAGIC,
+    .MaxFunction = 0,
+  };
+  if (Call(FEXUnixLibFunctions::GetPID, &Query) == STATUS_SUCCESS && Query.MaxFunction > FEXCore::ToUnderlying(FEXUnixLibFunctions::GetPID)) {
+    MaxFunctionCount = Query.MaxFunction;
+  } else {
+    // Older companion .so libraries without capability negotiation only guarantee ordinals up to GetPID.
+    MaxFunctionCount = FEXCore::ToUnderlying(FEXUnixLibFunctions::GetPID) + 1;
+  }
+
   // Give a log saying that the unix lib was loaded.
   LogMan::Msg::IFmt("FEX: Loaded FEXUnixLib");
   return true;
@@ -94,6 +109,10 @@ bool Init(HMODULE NtDll) {
 
 bool Available() {
   return UnixLibHandle != 0;
+}
+
+static bool SupportsFunction(FEXUnixLibFunctions Func) {
+  return Available() && FEXCore::ToUnderlying(Func) < MaxFunctionCount;
 }
 
 bool TryEnableHardwareTSO() {
@@ -211,14 +230,37 @@ uint32_t GetPID() {
 }
 
 bool SupportsTPIDRRO_CPU() {
-  if (Available()) {
+  if (SupportsFunction(FEXUnixLibFunctions::CheckSupportsTPIDRRO_CPU)) {
     FEXUnixLib_CheckSupportsTPIDRRO_CPU Args {};
-    Call(FEXUnixLibFunctions::CheckSupportsTPIDRRO_CPU, &Args);
-    // 1 means supports, anything else is unsupported.
-    return Args.Result == 1;
+    if (Call(FEXUnixLibFunctions::CheckSupportsTPIDRRO_CPU, &Args) == STATUS_SUCCESS) {
+      // 1 means supports, anything else is unsupported.
+      return Args.Result == 1;
+    }
   }
 
   return false;
+}
+
+bool TryEnableAPFLG() {
+  if (!SupportsFunction(FEXUnixLibFunctions::SetAPFLGControl)) {
+    return false;
+  }
+
+  FEXUnixLib_SetAPFLGControlArgs Args {
+    .Enable = true,
+  };
+  return Call(FEXUnixLibFunctions::SetAPFLGControl, &Args) == STATUS_SUCCESS;
+}
+
+bool DisableAPFLG() {
+  if (!SupportsFunction(FEXUnixLibFunctions::SetAPFLGControl)) {
+    return false;
+  }
+
+  FEXUnixLib_SetAPFLGControlArgs Args {
+    .Enable = false,
+  };
+  return Call(FEXUnixLibFunctions::SetAPFLGControl, &Args) == STATUS_SUCCESS;
 }
 
 } // namespace FEX::Windows::UnixLib

@@ -204,33 +204,7 @@ FileManager::FileManager(FEXCore::Context::Context* ctx)
   // - AppConfig override
   // This doesn't support the classic thunks interface.
 
-  const auto& AppName = AppConfigName();
-  fextl::vector<fextl::string> ConfigPaths {
-    FEXCore::Config::GetConfigFileLocation(true),
-    FEXCore::Config::GetConfigFileLocation(false),
-    ThunkConfigFile,
-  };
-
-  auto SteamID = getenv("SteamAppId");
-  if (SteamID) {
-    // If a SteamID exists then let's search for Steam application configs as well.
-    // We want to key off both the SteamAppId number /and/ the executable since we may not want to thunk all binaries.
-    fextl::string SteamAppName = fextl::fmt::format("Steam_{}_{}", SteamID, AppName);
-
-    // Steam application configs interleaved with non-steam for priority sorting.
-    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(SteamAppName, true));
-    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, true));
-    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(SteamAppName, false));
-    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, false));
-  } else {
-    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, true));
-    ConfigPaths.emplace_back(FEXCore::Config::GetApplicationConfig(AppName, false));
-  }
-
-  const char* AppConfig = getenv("FEX_APP_CONFIG");
-  if (AppConfig) {
-    ConfigPaths.emplace_back(AppConfig);
-  }
+  const auto ConfigPaths = FEX::Config::GetThunksDBConfigPaths(AppConfigName(), ThunkConfigFile);
 
   if (!LDPath().empty()) {
     RootFSFD = open(LDPath().c_str(), O_DIRECTORY | O_PATH | O_CLOEXEC);

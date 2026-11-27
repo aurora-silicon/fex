@@ -84,6 +84,15 @@ FEX_DEFAULT_VISIBILITY void SetConfigDirectory(const std::string_view Path, bool
 FEX_DEFAULT_VISIBILITY void SetConfigFileLocation(std::string_view Path, bool Global);
 FEX_DEFAULT_VISIBILITY void SetCacheDirectory(const std::string_view Path);
 
+/**
+ * @brief Marks this configuration as loaded for a process that runs with credentials its caller did not have.
+ *
+ * A relative path in the configuration then resolves only under the system's directories, never against the
+ * caller's working directory or HOME, and the per-user code caches and telemetry are off.
+ */
+FEX_DEFAULT_VISIBILITY void SetSecureExecution(bool SecureExecution);
+FEX_DEFAULT_VISIBILITY bool GetSecureExecution();
+
 FEX_DEFAULT_VISIBILITY const fextl::string& GetDataDirectory(bool Global = false);
 FEX_DEFAULT_VISIBILITY const fextl::string& GetConfigDirectory(bool Global);
 FEX_DEFAULT_VISIBILITY const fextl::string& GetConfigFileLocation(bool Global = false);

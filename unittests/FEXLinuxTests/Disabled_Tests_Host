@@ -1,1 +1,3 @@
-
+# FEX refuses the userfaultfd modes that wait for a handler thread, a real kernel offers them.
+userfaultfd.64
+userfaultfd.32

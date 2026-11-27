@@ -543,9 +543,12 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   uintptr_t HostCode {};
   auto GuestRip = Record->GuestRIP;
 
+  // Keep Frame->State.rip current so a deferred async signal fired at ExitFunctionLinkerAddress's
+  // EmitPendingInterruptFaultCheck sees the exact target RIP rather than a stale earlier RIP.
+  Frame->State.rip = GuestRip;
+
   if (TFSet) {
     // If TF is set, the cache must be skipped as different code needs to be generated.
-    Frame->State.rip = GuestRip;
     return Frame->Pointers.DispatcherLoopTop;
   } else {
     {
@@ -785,21 +788,20 @@ void Arm64JITCore::EmitTFCheck() {
   (void)Bind(&l_TFUnset);
 }
 
-void Arm64JITCore::EmitSuspendInterruptCheck() {
-  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
-    // Trigger a fault if there are any pending interrupts
-    // Used only for gdbserver at the moment
-    constexpr size_t InterruptPageOffset =
-      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
-    if constexpr (InterruptPageOffset <= 32760) {
-      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
-    } else {
-      // Need to use vector 128-bit store for this range.
-      // Doesn't matter which register we use to store.
-      str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
-    }
+void Arm64JITCore::EmitPendingInterruptFaultCheck() {
+  // Trigger a fault if there are any pending interrupts
+  constexpr size_t InterruptPageOffset =
+    offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+  if constexpr (InterruptPageOffset <= 32760) {
+    str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
+  } else {
+    // Need to use vector 128-bit store for this range.
+    // Doesn't matter which register we use to store.
+    str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
   }
+}
 
+void Arm64JITCore::EmitSuspendInterruptCheck() {
 #ifdef _WIN32
   static constexpr uint16_t SuspendMagic {0xCAFE};
 
@@ -962,9 +964,6 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
 
       // if there's a pending branch, and it is not fall-through
       if (PendingTargetLabel && PendingTargetLabel != Target) {
-        if (PendingTargetLabel->Backward.Location) {
-          EmitSuspendInterruptCheck();
-        }
         b_OrRestart(PendingTargetLabel);
         PendingTargetLabel = nullptr;
       }
@@ -997,6 +996,16 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
       PendingTargetLabel = nullptr;
 
       BindOrRestart(Target);
+
+      // Blocks the decoder made for a guest address start a guest instruction: they carry its offset, or are the entry block.
+      // Every branch to a guest instruction lands here, so checking here covers every loop, with the guest state exactly at
+      // the start of an instruction. Blocks inside an instruction, like a REP loop, have neither, so that loop finishes first.
+      if (CTX->Config.NeedsPendingInterruptFaultCheck && (BlockIROp->EntryPoint || BlockIROp->GuestEntryOffset != 0)) {
+        if (!BlockIROp->EntryPoint) {
+          DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
+        }
+        EmitPendingInterruptFaultCheck();
+      }
     }
 
     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
@@ -1018,9 +1027,6 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
 
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
-    if (PendingTargetLabel->Backward.Location) {
-      EmitSuspendInterruptCheck();
-    }
     b_OrRestart(PendingTargetLabel);
   }
   PendingTargetLabel = nullptr;

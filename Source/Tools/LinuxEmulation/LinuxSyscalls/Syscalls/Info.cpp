@@ -87,6 +87,9 @@ void RegisterInfo(FEX::HLE::SyscallHandler* Handler) {
     // Return the old persona while setting the new one.
     auto OldPersona = Thread->persona;
     Thread->persona = persona;
+    if (((OldPersona ^ persona) & READ_IMPLIES_EXEC) != 0) {
+      FEX::HLE::_SyscallHandler->TM.InvalidateGuestCodeRange(Thread->Thread, 0, ~0ULL);
+    }
     return OldPersona;
   });
 

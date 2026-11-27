@@ -158,6 +158,11 @@ static int EnableAfterFork = 0;
 static bool Enable = false;
 
 void Init(std::string_view ProgramName, std::string_view ProgramPath) {
+  if (FEXCore::Config::GetSecureExecution()) {
+    // With credentials the caller did not have, the caller's environment doesn't turn profiling on.
+    return;
+  }
+
   const char* ProfileTargetName = getenv("FEX_PROFILE_TARGET_NAME"); // Match by application name
   const char* ProfileTargetPath = getenv("FEX_PROFILE_TARGET_PATH"); // Match by path suffix
   const char* WaitForFork = getenv("FEX_PROFILE_WAIT_FOR_FORK");     // Don't enable profiling until the process forks N times

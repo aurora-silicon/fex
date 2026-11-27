@@ -92,6 +92,7 @@ typedef void ThunkedFunction(void* ArgsRv);
 struct ThunkDefinition final {
   SHA256Sum Sum;
   ThunkedFunction* ThunkFunction;
+  bool IsNoFPLeaf {false};
 };
 
 } // namespace FEXCore::IR

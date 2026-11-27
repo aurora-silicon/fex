@@ -92,3 +92,36 @@ TEST_CASE("SMC: shm_open_mmap_mmap_fd_fd2") {
   auto code8 = (char*)mmap(0, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, fd2, 0);
   CHECK(test_shared(code7, code8, "shm_open_mmap_mmap_fd_fd2") == 0);
 }
+
+// A writable view that only appears after the code has run, as in .NET's W^X double mapping:
+// code is written through short-lived RW views of a memfd and runs from a long-lived RX view.
+TEST_CASE("SMC: memfd_late_rw_view") {
+  int fd = memfd_create("smc-tests", 0);
+  REQUIRE(ftruncate(fd, 4096) == 0);
+  auto exec = (char*)mmap(0, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+
+  auto rw = (char*)mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  memcpy(rw, "\xB8\xAA\xBB\xCC\xDD\xC3", 6); // mov eax, 0xDDCCBBAA; ret
+  munmap(rw, 4096);
+  CHECK(((int (*)())exec)() == (int)0xDDCCBBAA);
+
+  rw = (char*)mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  rw[3] = 0xFE;
+  CHECK(((int (*)())exec)() == (int)0xDDFEBBAA);
+}
+
+TEST_CASE("SMC: memfd_view_mprotected_writable") {
+  int fd = memfd_create("smc-tests", 0);
+  REQUIRE(ftruncate(fd, 4096) == 0);
+  auto exec = (char*)mmap(0, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+  auto view = (char*)mmap(0, 4096, PROT_NONE, MAP_SHARED, fd, 0);
+
+  REQUIRE(mprotect(view, 4096, PROT_READ | PROT_WRITE) == 0);
+  memcpy(view, "\xB8\xAA\xBB\xCC\xDD\xC3", 6);
+  REQUIRE(mprotect(view, 4096, PROT_NONE) == 0);
+  CHECK(((int (*)())exec)() == (int)0xDDCCBBAA);
+
+  REQUIRE(mprotect(view, 4096, PROT_READ | PROT_WRITE) == 0);
+  view[3] = 0xFE;
+  CHECK(((int (*)())exec)() == (int)0xDDFEBBAA);
+}

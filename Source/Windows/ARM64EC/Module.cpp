@@ -751,6 +751,8 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
   Exception::LoadStateFromECContext(Thread, *Context);
 }
 
+FEX_DEFINE_WINE_APFLG_CPSR_PROBE(ProbeWineAPFLGCPSR, "\"#NtContinueNative\"")
+
 NTSTATUS ProcessInit() {
   if (!InitSyscalls()) {
     return STATUS_NOT_SUPPORTED;
@@ -785,9 +787,11 @@ NTSTATUS ProcessInit() {
     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
   }
 
+  bool SupportsAPFLG = false;
   {
-    auto HostFeatures =
-      FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec, FEX::Windows::UnixLib::GetPID());
+    auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec,
+                                                                     FEX::Windows::UnixLib::GetPID(), ProbeWineAPFLGCPSR);
+    SupportsAPFLG = HostFeatures.SupportsAPFLG;
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   }
 
@@ -803,7 +807,7 @@ NTSTATUS ProcessInit() {
 
   HandleImageMap(NtDllBase);
 
-  CPUFeatures.emplace(*CTX);
+  CPUFeatures.emplace(*CTX, SupportsAPFLG);
 
   X64ReturnInstr = ::VirtualAlloc(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, MEM_COMMIT | MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE);
   InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(X64ReturnInstr), FEXCore::Utils::FEX_PAGE_SIZE,
@@ -984,6 +988,11 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 }
 
 NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+  if (FEX::Windows::CPUFeatures::HandleAPFLGProbeException(
+        Exception, NativeContext, [](ARM64_NT_CONTEXT* Context, BOOLEAN Alert) { return NtContinueNative(Context, Alert); })) {
+    return STATUS_SUCCESS;
+  }
+
   bool Cont {};
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
@@ -1154,6 +1163,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
       HandleImageUnmap(Start, Size);
     }
   } else {
+    InvalidationTracker->EndSectionUnmap();
     ThreadCreationMutex.unlock();
   }
 }
@@ -1239,6 +1249,10 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
 }
 
 NTSTATUS ThreadInit() {
+  if (CPUFeatures) {
+    CPUFeatures->EnableAPFLGForCurrentThread();
+  }
+
   std::scoped_lock Lock(ThreadCreationMutex);
   FEX::Windows::InitCRTThread();
   const auto CPUArea = GetCPUArea();

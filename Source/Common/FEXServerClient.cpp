@@ -241,6 +241,12 @@ void UnlinkServerSocketPath() {
 }
 
 bool SetupClient(std::string_view InterpreterPath) {
+  if (FEXCore::Config::GetSecureExecution()) {
+    // With credentials the caller did not have, no FEXServer is used: the caller can bind the socket
+    // name it would connect to, and the server would choose the RootFS. The system config's stays.
+    return false;
+  }
+
   ServerFD = FEXServerClient::ConnectToAndStartServer(InterpreterPath);
   if (ServerFD == -1) {
     return false;

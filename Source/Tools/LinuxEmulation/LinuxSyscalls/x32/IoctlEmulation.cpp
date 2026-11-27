@@ -21,6 +21,7 @@
 #include <FEXCore/fextl/vector.h>
 
 #include <cstdint>
+#include <linux/userfaultfd.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -957,6 +958,11 @@ static constexpr std::array<DRMLRUCacheFDCache::HandlerType, 1U << _IOC_TYPEBITS
   for (auto& Handler : Handlers) {
     Handler = FEX::HLE::x32::BasicHandler::BasicHandler;
   }
+
+  // The userfaultfd structs have the same layout for 32-bit guests.
+  Handlers[UFFDIO] = [](FEXCore::Core::CpuStateFrame* Frame, int fd, uint32_t cmd, uint32_t args) -> uint32_t {
+    return FEX::HLE::UserfaultfdIoctl(fd, cmd, args);
+  };
 
 #define _BASIC_META(x) Handlers[_IOC_TYPE(x)] = FEX::HLE::x32::V4l2::V4l2Handler;
 #define _BASIC_META_VAR(x, args...) Handlers[_IOC_TYPE(x(args))] = FEX::HLE::x32::V4l2::V4l2Handler;

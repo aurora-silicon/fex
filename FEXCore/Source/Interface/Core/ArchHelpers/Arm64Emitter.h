@@ -142,6 +142,10 @@ protected:
     // with certain canned values that accelerate some operations. Will (obviously)
     // not load predicates, even if set to true, on host systems that do not support SVE.
     bool SetPredRegs {};
+
+    // Whether or not to update FPCR AFP bits (NEP/AH/FIZ). Can be disabled when the callee
+    // executes no FP/SIMD instructions and leaves FPCR intact.
+    bool SetAFP {true};
   };
   void FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options);
 
@@ -154,6 +158,7 @@ protected:
     uint32_t FPRSpillMask {~0U};
     bool FPRs {true};
     bool NZCV {true};
+    bool FPCR {true};
   };
 
   struct FillStaticRegOptions final {
@@ -163,6 +168,7 @@ protected:
     uint32_t FPRFillMask {~0U};
     bool FPRs {true};
     bool NZCV {true};
+    bool FPCR {true};
   };
 
   void SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options);

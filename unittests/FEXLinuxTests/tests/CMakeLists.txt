@@ -45,6 +45,8 @@ target_link_libraries(smc-mt-1.${BITNESS} PRIVATE pthread)
 
 target_link_libraries(smc-mt-2.${BITNESS} PRIVATE pthread)
 
+target_link_libraries(smc-mt-3.${BITNESS} PRIVATE pthread)
+
 target_link_libraries(smc-shared-1.${BITNESS} PRIVATE rt pthread)
 
 target_link_libraries(smc-shared-2.${BITNESS} PRIVATE rt pthread)
@@ -55,6 +57,8 @@ target_link_libraries(vulkan_procaddr.${BITNESS} PRIVATE ${CMAKE_DL_LIBS})
 target_include_directories(vulkan_procaddr.${BITNESS} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../External/Vulkan-Headers/include")
 
 target_link_libraries(timer-sigev-thread.${BITNESS} PRIVATE rt pthread)
+
+target_link_libraries(sigtest_async_mask.${BITNESS} PRIVATE pthread)
 
 target_link_libraries(smc-unexec-stack.${BITNESS} PRIVATE -Wl,-z,noexecstack)
 
