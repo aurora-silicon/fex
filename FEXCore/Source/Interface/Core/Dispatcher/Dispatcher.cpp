@@ -1059,15 +1059,17 @@ void Dispatcher::EmitF32ToExtF80() {
   ARMEmitter::ForwardLabel Done;
   ARMEmitter::BiDirectionalLabel NormalPath;
   ARMEmitter::ForwardLabel ZeroResult;
+  ARMEmitter::ForwardLabel PosZero;
 
   fmov(ARMEmitter::Size::i32Bit, TMP1, VTMP1.S());
+  (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &PosZero);
 
   ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 23, 8);
   and_(ARMEmitter::Size::i32Bit, TMP3, TMP1, 0x007FFFFF);
   lsr(ARMEmitter::Size::i32Bit, TMP4, TMP1, 31);
 
-  cmp(ARMEmitter::Size::i32Bit, TMP2, 0xFF);
-  (void)b(ARMEmitter::Condition::CC_EQ, &InfNaN);
+  sub(ARMEmitter::Size::i32Bit, TMP1, TMP2, 0xFF);
+  (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &InfNaN);
 
   (void)cbz(ARMEmitter::Size::i32Bit, TMP2, &ZeroDenormal);
 
@@ -1103,6 +1105,10 @@ void Dispatcher::EmitF32ToExtF80() {
   ins(ARMEmitter::SubRegSize::i16Bit, VTMP1, 4, TMP2);
   (void)b(&Done);
 
+  (void)Bind(&PosZero);
+  movi(ARMEmitter::SubRegSize::i64Bit, VTMP1.Q(), 0);
+  (void)b(&Done);
+
   (void)Bind(&InfNaN);
   (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &NaN);
 
@@ -1136,16 +1142,18 @@ void Dispatcher::EmitF64ToExtF80() {
   ARMEmitter::ForwardLabel Done;
   ARMEmitter::BiDirectionalLabel NormalPath;
   ARMEmitter::ForwardLabel ZeroResult;
+  ARMEmitter::ForwardLabel PosZero;
 
   fmov(ARMEmitter::Size::i64Bit, TMP1, VTMP1.D());
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &PosZero);
 
   lsr(ARMEmitter::Size::i64Bit, TMP4, TMP1, 63);
   ubfx(ARMEmitter::Size::i64Bit, TMP2, TMP1, 52, 11);
   LoadConstant(ARMEmitter::Size::i64Bit, TMP3, 0x000FFFFFFFFFFFFFULL);
   and_(ARMEmitter::Size::i64Bit, TMP3, TMP1, TMP3);
 
-  cmp(ARMEmitter::Size::i64Bit, TMP2, 0x7FF);
-  (void)b(ARMEmitter::Condition::CC_EQ, &InfNaN);
+  sub(ARMEmitter::Size::i64Bit, TMP1, TMP2, 0x7FF);
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &InfNaN);
 
   (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &ZeroDenormal);
 
@@ -1178,6 +1186,10 @@ void Dispatcher::EmitF64ToExtF80() {
   lsl(ARMEmitter::Size::i64Bit, TMP2, TMP4, 15);
   movi(ARMEmitter::SubRegSize::i64Bit, VTMP1.Q(), 0);
   ins(ARMEmitter::SubRegSize::i16Bit, VTMP1, 4, TMP2);
+  (void)b(&Done);
+
+  (void)Bind(&PosZero);
+  movi(ARMEmitter::SubRegSize::i64Bit, VTMP1.Q(), 0);
   (void)b(&Done);
 
   (void)Bind(&InfNaN);
@@ -2601,21 +2613,13 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
 
   switch (ABI) {
   case FABI_F80_I16_F32_PTR: {
-    // Save NZCV - it's a static register (guest x86 flags) and the inline code clobbers it
-    mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
-    str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[24]));
     EmitF32ToExtF80();
-    ldr(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[24]));
-    msr(ARMEmitter::SystemRegister::NZCV, TMP1);
   } break;
   case FABI_F80_I16_F64_PTR: {
-    mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
-    str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[24]));
     EmitF64ToExtF80();
-    ldr(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[24]));
-    msr(ARMEmitter::SystemRegister::NZCV, TMP1);
   } break;
   case FABI_F80_I16_I16_PTR: {
+    // Save NZCV - it's a static register (guest x86 flags) and the inline code clobbers it
     mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
     str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[24]));
     EmitI16ToExtF80();
@@ -2655,6 +2659,16 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): source
+    // Fast-path +0.0 (significand == 0 && signExp == 0): VTMP1.D() is already +0.0
+    // and extF80(+0.0) -> f64 has no rounding-mode dependence or FP exceptions.
+    ARMEmitter::ForwardLabel SlowPath;
+    fmov(ARMEmitter::Size::i64Bit, TMP1, VTMP1.D());
+    umov<ARMEmitter::SubRegSize::i16Bit>(TMP2, VTMP1, 4);
+    orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SlowPath);
+    ret();
+
+    (void)Bind(&SlowPath);
     SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));

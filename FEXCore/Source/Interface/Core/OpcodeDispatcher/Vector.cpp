@@ -2981,6 +2981,11 @@ void OpDispatchBuilder::FXSaveOp(OpcodeArgs) {
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
 
   SaveX87State(Op, Mem);
+  if (ReducedPrecisionMode) {
+    // SaveX87State splits the IR block in ReducedPrecisionMode, so rematerialize Mem
+    // to avoid cross-block SSA liveness.
+    Mem = MakeSegmentAddress(Op, Op->Dest);
+  }
   SaveSSEState(Mem);
   SaveMXCSRState(Mem);
 }
@@ -3009,7 +3014,7 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
     StartNewBlock();
     { fn(); }
     auto Jump_ = Jump();
-    auto NextJumpTarget = CreateNewCodeBlockAfter(StoreBlock);
+    auto NextJumpTarget = CreateNewCodeBlockAfter(GetCurrentBlock());
     SetJumpTarget(Jump_, NextJumpTarget);
     SetFalseJumpTarget(CondJump_, NextJumpTarget);
     SetCurrentCodeBlock(NextJumpTarget);
@@ -3130,17 +3135,71 @@ void OpDispatchBuilder::SaveX87State(OpcodeArgs, Ref MemBase) {
   // This is implementation dependent
   //
   // x87 registers are stored rotated depending on the current TOP.
-  Ref Top = GetX87Top();
-  auto SevenConst = Constant(7);
-  const auto LoadSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  if (ReducedPrecisionMode) {
+    // Fast-path all-zero x87 state: under X87ReducedPrecision all 8 slots live in mm[i][0].
+    // Bitwise OR-reducing mm[0..7][0] guarantees every slot is +0.0 (rejecting -0.0 and any
+    // freed non-zero slot regardless of FTW/TOP), matching 8x F80CVTTo(+0.0) -> 16 zero bytes.
+    Ref M0 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 0 * 16);
+    Ref M1 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 1 * 16);
+    Ref M2 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 2 * 16);
+    Ref M3 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 3 * 16);
+    Ref M4 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 4 * 16);
+    Ref M5 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 5 * 16);
+    Ref M6 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 6 * 16);
+    Ref M7 = _LoadContextGPR(OpSize::i64Bit, MMBaseOffset() + 7 * 16);
 
-  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
-    Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
-    if (ReducedPrecisionMode) {
-      data = _F80CVTTo(data, OpSize::i64Bit);
+    Ref Or01 = _Or(OpSize::i64Bit, M0, M1);
+    Ref Or23 = _Or(OpSize::i64Bit, M2, M3);
+    Ref Or45 = _Or(OpSize::i64Bit, M4, M5);
+    Ref Or67 = _Or(OpSize::i64Bit, M6, M7);
+    Ref Or03 = _Or(OpSize::i64Bit, Or01, Or23);
+    Ref Or47 = _Or(OpSize::i64Bit, Or45, Or67);
+    Ref AnyNonZero = _Or(OpSize::i64Bit, Or03, Or47);
+
+    auto ZeroBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+    auto SlowBlock = CreateNewCodeBlockAfter(ZeroBlock);
+    auto ExitBlock = CreateNewCodeBlockAfter(SlowBlock);
+
+    auto CondJump_ = CondJump(AnyNonZero, CondClass::NEQ);
+    SetTrueJumpTarget(CondJump_, SlowBlock);
+    SetFalseJumpTarget(CondJump_, ZeroBlock);
+
+    SetCurrentCodeBlock(ZeroBlock);
+    StartNewBlock();
+    {
+      Ref Base = MakeSegmentAddress(Op, Op->Dest);
+      Ref ZeroVec = LoadZeroVector(OpSize::i128Bit);
+      for (uint32_t j = 0; j < Core::CPUState::NUM_MMS / 2; ++j) {
+        _StoreMemPairFPR(OpSize::i128Bit, ZeroVec, ZeroVec, Base, 32 + 32 * j);
+      }
+      Jump(ExitBlock);
     }
-    _StoreMemFPR(OpSize::i128Bit, data, MemBase, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
-    Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
+
+    SetCurrentCodeBlock(SlowBlock);
+    StartNewBlock();
+    {
+      Ref Base = MakeSegmentAddress(Op, Op->Dest);
+      Ref Top = GetX87Top();
+      auto SevenConst = Constant(7);
+      for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
+        Ref data = _LoadContextFPRIndexed(Top, OpSize::i64Bit, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+        data = _F80CVTTo(data, OpSize::i64Bit);
+        _StoreMemFPR(OpSize::i128Bit, data, Base, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+        Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
+      }
+      Jump(ExitBlock);
+    }
+
+    SetCurrentCodeBlock(ExitBlock);
+    StartNewBlock();
+  } else {
+    Ref Top = GetX87Top();
+    auto SevenConst = Constant(7);
+    for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
+      Ref data = _LoadContextFPRIndexed(Top, OpSize::i128Bit, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+      _StoreMemFPR(OpSize::i128Bit, data, MemBase, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+      Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
+    }
   }
 }
 
