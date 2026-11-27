@@ -223,8 +223,12 @@ private:
     case OP_ALLOCATEGPRAFTER: return true;
     case OP_ALLOCATEFPR: return true;
     case OP_RMWHANDLE: return PhysicalRegister(Node) == PhysicalRegister(Header->Args[0]);
-    case OP_LOADREGISTER: return PhysicalRegister(Node) == DecodeSRAReg(Header, Node);
-    case OP_STOREREGISTER: return PhysicalRegister(Header->Args[0]) == DecodeSRAReg(Header, Node);
+    case OP_LOADREGISTER:
+    case OP_LOADPF:
+    case OP_LOADAF: return PhysicalRegister(Node) == DecodeSRAReg(Header, Node);
+    case OP_STOREREGISTER:
+    case OP_STOREPF:
+    case OP_STOREAF: return PhysicalRegister(Header->Args[0]) == DecodeSRAReg(Header, Node);
     default: return false;
     }
   }

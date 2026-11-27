@@ -688,8 +688,9 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
       return;
     }
 
+    auto FirstArg = CurrentIR.GetOp<IR::IROp_Header>(Prev->Args[0]);
     auto SecondArg = CurrentIR.GetOp<IR::IROp_Header>(Prev->Args[1]);
-    if (SecondArg->Op != OP_INLINECONSTANT || SecondArg->C<IR::IROp_InlineConstant>()->Constant != 0) {
+    if (FirstArg->Op == OP_INLINECONSTANT || SecondArg->Op != OP_INLINECONSTANT || SecondArg->C<IR::IROp_InlineConstant>()->Constant != 0) {
       return;
     }
 

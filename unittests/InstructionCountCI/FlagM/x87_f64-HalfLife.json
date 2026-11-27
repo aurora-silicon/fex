@@ -13,7 +13,7 @@
       "SVE256",
       "AFP"
     ],
-    "BinaryCacheVersion": 47
+    "BinaryCacheVersion": 48
   },
   "Instructions": {
     "Block1": {
@@ -1196,7 +1196,7 @@
         "ldr w20, [x28, #992]",
         "ldr w4, [x20, #20]",
         "str w4, [x8, #156]",
-        "subs w26, w4, w4",
+        "negs w26, wzr",
         "mov w4, #0x0",
         "mov w20, #0x869c",
         "movk w20, #0x5, lsl #16",

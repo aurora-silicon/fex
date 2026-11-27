@@ -27,9 +27,37 @@ namespace FEXCore::CPU {
   }
 
 DEF_BINOP_WITH_CONSTANT(Add, add, add)
-DEF_BINOP_WITH_CONSTANT(Sub, sub, sub)
+DEF_OP(Sub) {
+  auto Op = IROp->C<IR::IROp_Sub>();
+
+  uint64_t Const;
+  if (IsInlineConstant(Op->Src2, &Const)) {
+    if (IsInlineConstant(Op->Src1)) {
+      LOGMAN_THROW_A_FMT(Const == 0, "Only zero inline constant supported when both Sub sources are inline constants");
+      sub(ConvertSize(IROp), GetReg(Node), GetZeroableReg(Op->Src1), ARMEmitter::Reg::zr);
+    } else {
+      sub(ConvertSize(IROp), GetReg(Node), GetReg(Op->Src1), Const);
+    }
+  } else {
+    sub(ConvertSize(IROp), GetReg(Node), GetZeroableReg(Op->Src1), GetReg(Op->Src2));
+  }
+}
 DEF_BINOP_WITH_CONSTANT(AddWithFlags, adds, adds)
-DEF_BINOP_WITH_CONSTANT(SubWithFlags, subs, subs)
+DEF_OP(SubWithFlags) {
+  auto Op = IROp->C<IR::IROp_SubWithFlags>();
+
+  uint64_t Const;
+  if (IsInlineConstant(Op->Src2, &Const)) {
+    if (IsInlineConstant(Op->Src1)) {
+      LOGMAN_THROW_A_FMT(Const == 0, "Only zero inline constant supported when both SubWithFlags sources are inline constants");
+      subs(ConvertSize(IROp), GetReg(Node), GetZeroableReg(Op->Src1), ARMEmitter::Reg::zr);
+    } else {
+      subs(ConvertSize(IROp), GetReg(Node), GetReg(Op->Src1), Const);
+    }
+  } else {
+    subs(ConvertSize(IROp), GetReg(Node), GetZeroableReg(Op->Src1), GetReg(Op->Src2));
+  }
+}
 DEF_BINOP_WITH_CONSTANT(Or, orr, orr)
 DEF_BINOP_WITH_CONSTANT(And, and_, and_)
 DEF_BINOP_WITH_CONSTANT(Andn, bic, bic)
@@ -280,7 +308,12 @@ DEF_OP(SubNZCV) {
   uint64_t Const;
   if (IsInlineConstant(Op->Src2, &Const)) {
     LOGMAN_THROW_A_FMT(OpSize >= IR::OpSize::i32Bit, "Constant not allowed here");
-    cmp(EmitSize, GetReg(Op->Src1), Const);
+    if (IsInlineConstant(Op->Src1)) {
+      LOGMAN_THROW_A_FMT(Const == 0, "Only zero inline constant supported when both SubNZCV sources are inline constants");
+      cmp(EmitSize, GetZeroableReg(Op->Src1), ARMEmitter::Reg::zr);
+    } else {
+      cmp(EmitSize, GetReg(Op->Src1), Const);
+    }
   } else {
     unsigned Shift = OpSize < IR::OpSize::i32Bit ? (32 - IR::OpSizeAsBits(OpSize)) : 0;
     ARMEmitter::Register ShiftedSrc1 = GetZeroableReg(Op->Src1);

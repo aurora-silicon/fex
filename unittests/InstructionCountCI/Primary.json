@@ -10,7 +10,7 @@
       "FLAGM2",
       "MOPS"
     ],
-    "BinaryCacheVersion": 47
+    "BinaryCacheVersion": 48
   },
   "Instructions": {
     "add bl, cl": {
@@ -4399,7 +4399,7 @@
     "xor al, al": {
       "ExpectedInstructionCount": 2,
       "ExpectedArm64ASM": [
-        "subs w26, w4, w4",
+        "negs w26, wzr",
         "and x4, x4, #0xffffffffffffff00"
       ]
     },
@@ -4412,7 +4412,7 @@
     "xor ah, ah": {
       "ExpectedInstructionCount": 2,
       "ExpectedArm64ASM": [
-        "subs w26, w4, w4",
+        "negs w26, wzr",
         "and x4, x4, #0xffffffffffff00ff"
       ]
     },
@@ -4461,7 +4461,7 @@
     "xor ax, ax": {
       "ExpectedInstructionCount": 2,
       "ExpectedArm64ASM": [
-        "subs w26, w4, w4",
+        "negs w26, wzr",
         "and x4, x4, #0xffffffffffff0000"
       ]
     },
@@ -4474,7 +4474,7 @@
     "xor eax, eax": {
       "ExpectedInstructionCount": 2,
       "ExpectedArm64ASM": [
-        "subs w26, w4, w4",
+        "negs w26, wzr",
         "mov w4, #0x0"
       ]
     },
@@ -4507,7 +4507,7 @@
       "ExpectedInstructionCount": 2,
       "Comment": "0xb0",
       "ExpectedArm64ASM": [
-        "subs w26, w4, w4",
+        "negs w26, wzr",
         "mov w4, #0x0"
       ]
     },

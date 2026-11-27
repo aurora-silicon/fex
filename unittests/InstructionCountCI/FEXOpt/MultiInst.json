@@ -13,7 +13,7 @@
       "RPRES",
       "AFP"
     ],
-    "BinaryCacheVersion": 47
+    "BinaryCacheVersion": 48
   },
   "Comment": [
     "These are instruction combinations that could be more optimal if FEX optimized for them"
@@ -85,7 +85,7 @@
         "div rcx"
       ],
       "ExpectedArm64ASM": [
-        "subs w26, w5, w5",
+        "negs w26, wzr",
         "mov w5, #0x0",
         "udiv x20, x4, x7",
         "msub x22, x20, x7, x4",
@@ -124,7 +124,7 @@
       ],
       "ExpectedArm64ASM": [
         "mov w4, w11",
-        "subs w26, w5, w5",
+        "negs w26, wzr",
         "mov w5, #0x0",
         "udiv w20, w4, w10",
         "msub w22, w20, w10, w4",
