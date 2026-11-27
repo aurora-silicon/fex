@@ -71,8 +71,8 @@ public:
     return 0;
   }
 
-  // Whether the frontend takes signals at the pending interrupt fault checks, which the JIT and dispatcher then emit at the
-  // start of every guest basic block and before syscalls.
+  // Whether the frontend takes signals at the pending interrupt fault checks, which the JIT and dispatcher then emit at
+  // guest entry points, intra-block loop back-edge targets, and before syscalls.
   virtual bool NeedsPendingInterruptFaultCheck() const {
     return false;
   }

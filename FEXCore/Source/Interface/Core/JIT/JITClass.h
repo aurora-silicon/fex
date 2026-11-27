@@ -103,6 +103,8 @@ private:
   CPUBackend::CompiledCode CodeData {};
 
   fextl::vector<ARMEmitter::BiDirectionalLabel> JumpTargets;
+  fextl::vector<uint32_t> BlockOrder;
+  fextl::vector<uint8_t> IsBackEdgeTarget;
 
   ARMEmitter::BiDirectionalLabel* JumpTarget(IR::OrderedNodeWrapper Node) {
     auto Block = IR->GetOp<IR::IROp_CodeBlock>(Node);

@@ -876,6 +876,46 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   RequiresFarARM64Jumps = false;
   SSANodeMultiplier = 24;
 
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    const uint32_t BlockCount = IR->GetHeader()->BlockCount;
+    BlockOrder.assign(BlockCount, ~0U);
+    IsBackEdgeTarget.assign(BlockCount, 0);
+
+    uint32_t Order = 0;
+    for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+      auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+      BlockOrder[BlockIROp->ID] = Order++;
+    }
+
+    auto MarkIfBackEdge = [&](IR::OrderedNodeWrapper DstWrapper, uint32_t SrcOrder) {
+      auto DstBlock = IR->GetOp<FEXCore::IR::IROp_CodeBlock>(DstWrapper);
+      if (BlockOrder[DstBlock->ID] <= SrcOrder) {
+        IsBackEdgeTarget[DstBlock->ID] = 1;
+      }
+    };
+
+    for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+      auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
+      const uint32_t SrcOrder = BlockOrder[BlockIROp->ID];
+      if (BlockIROp->Last == BlockIROp->Begin) {
+        continue;
+      }
+      auto CodeLast = IR->at(BlockIROp->Last);
+      auto [LastNode, LastOp] = CodeLast();
+      if (LastOp->Op == IR::OP_ENDBLOCK) {
+        --CodeLast;
+      }
+      auto [ExitNode, ExitOp] = CodeLast();
+      if (ExitOp->Op == IR::OP_JUMP) {
+        MarkIfBackEdge(ExitOp->C<IR::IROp_Jump>()->TargetBlock, SrcOrder);
+      } else if (ExitOp->Op == IR::OP_CONDJUMP) {
+        auto CondJumpOp = ExitOp->C<IR::IROp_CondJump>();
+        MarkIfBackEdge(CondJumpOp->TrueBlock, SrcOrder);
+        MarkIfBackEdge(CondJumpOp->FalseBlock, SrcOrder);
+      }
+    }
+  }
+
   // Prepare restart via long jump in case branch encoding fails.
   // This uses UncheckedLongJump since we don't implement std::longjmp in WoA setups
   switch (static_cast<RestartOptions::Control>(FEXCore::UncheckedLongJump::SetJump(ThreadState->RestartJump))) {
@@ -998,9 +1038,12 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
       BindOrRestart(Target);
 
       // Blocks the decoder made for a guest address start a guest instruction: they carry its offset, or are the entry block.
-      // Every branch to a guest instruction lands here, so checking here covers every loop, with the guest state exactly at
-      // the start of an instruction. Blocks inside an instruction, like a REP loop, have neither, so that loop finishes first.
-      if (CTX->Config.NeedsPendingInterruptFaultCheck && (BlockIROp->EntryPoint || BlockIROp->GuestEntryOffset != 0)) {
+      // Emit the pending interrupt check at every entry point (covering inter-multiblock edges and call returns) and at every
+      // intra-multiblock back-edge target (covering all loops, including self-loops and irreducible loops), while skipping
+      // forward-only internal blocks where execution reaches an exit or back-edge in bounded instructions. Blocks inside an
+      // instruction, like a REP loop, have neither, so that loop finishes first.
+      if (CTX->Config.NeedsPendingInterruptFaultCheck &&
+          (BlockIROp->EntryPoint || (BlockIROp->GuestEntryOffset != 0 && IsBackEdgeTarget[BlockIROp->ID]))) {
         if (!BlockIROp->EntryPoint) {
           DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
         }
