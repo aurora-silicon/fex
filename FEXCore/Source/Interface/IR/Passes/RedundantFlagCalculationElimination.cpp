@@ -18,6 +18,9 @@ $end_info$
 #include <FEXCore/fextl/deque.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <algorithm>
+#include <bit>
+
 // Flag bit flags
 #define FLAG_V (1U << 0)
 #define FLAG_C (1U << 1)
@@ -664,12 +667,79 @@ CondClass DeadFlagCalculationEliminination::X86ToArmFloatCond(CondClass X86) {
 }
 
 void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode) {
-  // Skip past StoreRegisters at the end -- they don't touch flags.
+  // Skip past metadata and register/flag spills at the end -- they don't touch
+  // NZCV or mutate SSA operands. Note: Jcc sets SideEffects=true so Core.cpp
+  // emits OP_GUESTOPCODE before CondJump, and TESTOp emits OP_INVALIDATEFLAGS.
   auto PrevWrap = CodeNode->Header.Previous;
-  while (CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREREGISTER ||
-         CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREPF || CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op == OP_STOREAF) {
-    PrevWrap = CurrentIR.GetNode(PrevWrap)->Header.Previous;
+  while (true) {
+    const auto PrevOp = CurrentIR.GetOp<IR::IROp_Header>(PrevWrap)->Op;
+    if (PrevOp == OP_STOREREGISTER || PrevOp == OP_STOREPF || PrevOp == OP_STOREAF || PrevOp == OP_GUESTOPCODE || PrevOp == OP_INVALIDATEFLAGS) {
+      PrevWrap = CurrentIR.GetNode(PrevWrap)->Header.Previous;
+      continue;
+    }
+    break;
   }
+
+  auto IsGPRNode = [&](OrderedNodeWrapper Wrap) -> bool {
+    const auto ArgOp = CurrentIR.GetOp<IR::IROp_Header>(Wrap)->Op;
+    return ArgOp != OP_INLINECONSTANT && ArgOp != OP_INLINEENTRYPOINTOFFSET;
+  };
+
+  auto TryGetConst = [&](OrderedNodeWrapper Wrap, uint64_t& Value) -> bool {
+    const auto Header = CurrentIR.GetOp<IR::IROp_Header>(Wrap);
+    if (Header->Op == OP_INLINECONSTANT) {
+      Value = Header->C<IR::IROp_InlineConstant>()->Constant;
+      return true;
+    }
+    if (Header->Op == OP_CONSTANT) {
+      Value = Header->C<IR::IROp_Constant>()->Constant;
+      return true;
+    }
+    return false;
+  };
+
+  auto TryMatchSingleBitConst = [&](OrderedNodeWrapper Arg0, OrderedNodeWrapper Arg1, uint32_t Width, Ref& OutVal, Ref& OutConst,
+                                    uint32_t& OutBit) -> bool {
+    const uint64_t Mask = Width == 64 ? ~0ULL : ((1ULL << Width) - 1);
+    uint64_t ConstVal {};
+    if (TryGetConst(Arg1, ConstVal) && IsGPRNode(Arg0)) {
+      const uint64_t Masked = ConstVal & Mask;
+      if (std::has_single_bit(Masked)) {
+        OutVal = CurrentIR.GetNode(Arg0);
+        OutConst = CurrentIR.GetNode(Arg1);
+        OutBit = std::countr_zero(Masked);
+        return true;
+      }
+    } else if (TryGetConst(Arg0, ConstVal) && IsGPRNode(Arg1)) {
+      const uint64_t Masked = ConstVal & Mask;
+      if (std::has_single_bit(Masked)) {
+        OutVal = CurrentIR.GetNode(Arg1);
+        OutConst = CurrentIR.GetNode(Arg0);
+        OutBit = std::countr_zero(Masked);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto FoldToBitTest = [&](Ref ValNode, uint32_t Bit, bool BranchIfSet) {
+    IREmit->SetWriteCursorBefore(CodeNode);
+    Ref BitConst = IREmit->_InlineConstant(Bit);
+    IREmit->ReplaceNodeArgument(CodeNode, 0, ValNode);
+    IREmit->ReplaceNodeArgument(CodeNode, 1, BitConst);
+    Op->FromNZCV = false;
+    Op->Cond = BranchIfSet ? CondClass::TSTNZ : CondClass::TSTZ;
+    Op->CompareSize = OpSize::iInvalid;
+  };
+
+  auto RemoveIfDeadConst = [&](Ref ConstNode) {
+    if (ConstNode && CurrentIR.GetOp<IR::IROp_Header>(ConstNode)->Op == OP_CONSTANT && ConstNode->GetUses() == 0) {
+      IREmit->Remove(ConstNode);
+    }
+  };
+
+  Ref ExtraDeadNode = nullptr;
+  Ref PossibleDeadConst = nullptr;
 
   auto Prev = CurrentIR.GetOp<IR::IROp_Header>(PrevWrap);
   if (Prev->Op == OP_AXFLAG) {
@@ -680,11 +750,49 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
     }
 
     Op->Cond = ArmCond;
+  } else if (Prev->Op == OP_TESTNZ || Prev->Op == OP_TESTZ) {
+    if (Prev->Size < OpSize::i8Bit || Prev->Size > OpSize::i64Bit) {
+      return;
+    }
+
+    const uint32_t Width = IR::OpSizeAsBits(Prev->Size);
+    if (Op->Cond == CondClass::EQ || Op->Cond == CondClass::NEQ) {
+      Ref ValNode {};
+      Ref ConstNode {};
+      uint32_t Bit {};
+      if (!TryMatchSingleBitConst(Prev->Args[0], Prev->Args[1], Width, ValNode, ConstNode, Bit)) {
+        return;
+      }
+
+      FoldToBitTest(ValNode, Bit, Op->Cond == CondClass::NEQ);
+      PossibleDeadConst = ConstNode;
+    } else if (Prev->Op == OP_TESTNZ &&
+               (Op->Cond == CondClass::MI || Op->Cond == CondClass::PL || Op->Cond == CondClass::SLT || Op->Cond == CondClass::SGE)) {
+      // TestNZ sets N to bit (Width - 1) of (Src1 & Src2) and clears V.
+      // Self-test (x & x) or a constant mask with the sign bit set tests bit (Width - 1) of x.
+      const uint32_t SignBit = Width - 1;
+      const uint64_t SignMask = 1ULL << SignBit;
+      Ref ValNode {};
+      uint64_t ConstVal {};
+      if (Prev->Args[0] == Prev->Args[1] && IsGPRNode(Prev->Args[0])) {
+        ValNode = CurrentIR.GetNode(Prev->Args[0]);
+      } else if (TryGetConst(Prev->Args[1], ConstVal) && (ConstVal & SignMask) != 0 && IsGPRNode(Prev->Args[0])) {
+        ValNode = CurrentIR.GetNode(Prev->Args[0]);
+        PossibleDeadConst = CurrentIR.GetNode(Prev->Args[1]);
+      } else if (TryGetConst(Prev->Args[0], ConstVal) && (ConstVal & SignMask) != 0 && IsGPRNode(Prev->Args[1])) {
+        ValNode = CurrentIR.GetNode(Prev->Args[1]);
+        PossibleDeadConst = CurrentIR.GetNode(Prev->Args[0]);
+      } else {
+        return;
+      }
+
+      const bool BranchIfSet = Op->Cond == CondClass::MI || Op->Cond == CondClass::SLT;
+      FoldToBitTest(ValNode, SignBit, BranchIfSet);
+    } else {
+      return;
+    }
   } else if (Prev->Op == OP_SUBNZCV) {
-    // Pattern match a branch fed by a compare. We could also handle bit tests
-    // here, but tbz/tbnz has a limited offset range which we don't have a way to
-    // deal with yet. Let's hope that's not a big deal.
-    if (!(Op->Cond == CondClass::NEQ || Op->Cond == CondClass::EQ) || (Prev->Size < OpSize::i32Bit)) {
+    if (Prev->Size < OpSize::i32Bit || Prev->Size > OpSize::i64Bit) {
       return;
     }
 
@@ -693,11 +801,37 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
       return;
     }
 
-    // We've matched. Fold the compare into branch.
-    IREmit->ReplaceNodeArgument(CodeNode, 0, CurrentIR.GetNode(Prev->Args[0]));
-    IREmit->ReplaceNodeArgument(CodeNode, 1, CurrentIR.GetNode(Prev->Args[1]));
-    Op->FromNZCV = false;
-    Op->CompareSize = Prev->Size;
+    if (!IsGPRNode(Prev->Args[0])) {
+      return;
+    }
+
+    if (Op->Cond == CondClass::NEQ || Op->Cond == CondClass::EQ) {
+      Ref FirstNode = CurrentIR.GetNode(Prev->Args[0]);
+      auto FirstOp = CurrentIR.GetOp<IR::IROp_Header>(FirstNode);
+      Ref ValNode {};
+      Ref ConstNode {};
+      uint32_t Bit {};
+      if (FirstOp->Op == OP_AND && FirstNode->GetUses() == 1 && FirstOp->Size >= OpSize::i32Bit && FirstOp->Size <= OpSize::i64Bit &&
+          TryMatchSingleBitConst(FirstOp->Args[0], FirstOp->Args[1],
+                                 std::min(IR::OpSizeAsBits(FirstOp->Size), IR::OpSizeAsBits(Prev->Size)), ValNode, ConstNode, Bit)) {
+        FoldToBitTest(ValNode, Bit, Op->Cond == CondClass::NEQ);
+        ExtraDeadNode = FirstNode;
+        PossibleDeadConst = ConstNode;
+      } else {
+        // We've matched. Fold the compare into branch.
+        IREmit->ReplaceNodeArgument(CodeNode, 0, FirstNode);
+        IREmit->ReplaceNodeArgument(CodeNode, 1, CurrentIR.GetNode(Prev->Args[1]));
+        Op->FromNZCV = false;
+        Op->CompareSize = Prev->Size;
+      }
+    } else if (Op->Cond == CondClass::MI || Op->Cond == CondClass::PL || Op->Cond == CondClass::SLT || Op->Cond == CondClass::SGE) {
+      // x - 0 sets N to bit (Width - 1) of x and clears V.
+      const uint32_t SignBit = IR::OpSizeAsBits(Prev->Size) - 1;
+      const bool BranchIfSet = Op->Cond == CondClass::MI || Op->Cond == CondClass::SLT;
+      FoldToBitTest(CurrentIR.GetNode(Prev->Args[0]), SignBit, BranchIfSet);
+    } else {
+      return;
+    }
   } else {
     return;
   }
@@ -706,6 +840,10 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
   // dead after the jump. The jump does not read flags anymore.  There is no
   // intervening instruction. Therefore the compare is dead.
   IREmit->Remove(CurrentIR.GetNode(PrevWrap));
+  if (ExtraDeadNode) {
+    IREmit->Remove(ExtraDeadNode);
+  }
+  RemoveIfDeadConst(PossibleDeadConst);
 }
 
 /**
