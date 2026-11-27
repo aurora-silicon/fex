@@ -8,7 +8,7 @@
     "DisabledHostFeatures": [
       "AFP"
     ],
-    "BinaryCacheVersion": 47
+    "BinaryCacheVersion": 48
   },
   "Instructions": {
     "vpermq ymm0, ymm1, 1": {
@@ -886,13 +886,12 @@
       ]
     },
     "vpermilpd xmm0, xmm1, 10b": {
-      "ExpectedInstructionCount": 2,
+      "ExpectedInstructionCount": 1,
       "Comment": [
         "Map 3 0b01 0x05 128-bit"
       ],
       "ExpectedArm64ASM": [
-        "mov v16.16b, v17.16b",
-        "mov v16.d[1], v17.d[1]"
+        "mov v16.16b, v17.16b"
       ]
     },
     "vpermilpd xmm0, xmm1, 11b": {
@@ -901,7 +900,7 @@
         "Map 3 0b01 0x05 128-bit"
       ],
       "ExpectedArm64ASM": [
-        "zip2 v16.2d, v17.2d, v17.2d"
+        "dup v16.2d, v17.d[1]"
       ]
     },
     "vpermilpd ymm0, ymm1, 0000b": {
@@ -921,7 +920,7 @@
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
         "ext v3.16b, v17.16b, v17.16b, #8",
-        "mov z2.d, d2",
+        "dup v2.2d, v2.d[0]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -929,17 +928,15 @@
       ]
     },
     "vpermilpd ymm0, ymm1, 0010b": {
-      "ExpectedInstructionCount": 8,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov v3.16b, v17.16b",
-        "mov v3.d[1], v17.d[1]",
-        "mov z2.d, d2",
+        "dup v2.2d, v2.d[0]",
         "mov z1.q, q2",
-        "mov z16.d, z3.d",
+        "mov z16.d, z17.d",
         "not p0.b, p7/z, p6.b",
         "mov z16.b, p0/m, z1.b"
       ]
@@ -951,8 +948,8 @@
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "zip2 v3.2d, v17.2d, v17.2d",
-        "mov z2.d, d2",
+        "dup v3.2d, v17.d[1]",
+        "dup v2.2d, v2.d[0]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -966,7 +963,7 @@
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov z3.d, d17",
+        "dup v3.2d, v17.d[0]",
         "ext v2.16b, v2.16b, v2.16b, #8",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
@@ -990,17 +987,15 @@
       ]
     },
     "vpermilpd ymm0, ymm1, 0110b": {
-      "ExpectedInstructionCount": 8,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov v3.16b, v17.16b",
-        "mov v3.d[1], v17.d[1]",
         "ext v2.16b, v2.16b, v2.16b, #8",
         "mov z1.q, q2",
-        "mov z16.d, z3.d",
+        "mov z16.d, z17.d",
         "not p0.b, p7/z, p6.b",
         "mov z16.b, p0/m, z1.b"
       ]
@@ -1012,7 +1007,7 @@
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "zip2 v3.2d, v17.2d, v17.2d",
+        "dup v3.2d, v17.d[1]",
         "ext v2.16b, v2.16b, v2.16b, #8",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
@@ -1021,14 +1016,13 @@
       ]
     },
     "vpermilpd ymm0, ymm1, 1000b": {
-      "ExpectedInstructionCount": 7,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov z3.d, d17",
-        "mov v2.d[1], v2.d[1]",
+        "dup v3.2d, v17.d[0]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -1036,14 +1030,13 @@
       ]
     },
     "vpermilpd ymm0, ymm1, 1001b": {
-      "ExpectedInstructionCount": 7,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
         "ext v3.16b, v17.16b, v17.16b, #8",
-        "mov v2.d[1], v2.d[1]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -1051,30 +1044,26 @@
       ]
     },
     "vpermilpd ymm0, ymm1, 1010b": {
-      "ExpectedInstructionCount": 8,
+      "ExpectedInstructionCount": 5,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov v3.16b, v17.16b",
-        "mov v3.d[1], v17.d[1]",
-        "mov v2.d[1], v2.d[1]",
         "mov z1.q, q2",
-        "mov z16.d, z3.d",
+        "mov z16.d, z17.d",
         "not p0.b, p7/z, p6.b",
         "mov z16.b, p0/m, z1.b"
       ]
     },
     "vpermilpd ymm0, ymm1, 1011b": {
-      "ExpectedInstructionCount": 7,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "zip2 v3.2d, v17.2d, v17.2d",
-        "mov v2.d[1], v2.d[1]",
+        "dup v3.2d, v17.d[1]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -1088,8 +1077,8 @@
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov z3.d, d17",
-        "zip2 v2.2d, v2.2d, v2.2d",
+        "dup v3.2d, v17.d[0]",
+        "dup v2.2d, v2.d[1]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -1104,7 +1093,7 @@
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
         "ext v3.16b, v17.16b, v17.16b, #8",
-        "zip2 v2.2d, v2.2d, v2.2d",
+        "dup v2.2d, v2.d[1]",
         "mov z1.q, q2",
         "mov z16.d, z3.d",
         "not p0.b, p7/z, p6.b",
@@ -1112,17 +1101,15 @@
       ]
     },
     "vpermilpd ymm0, ymm1, 1110b": {
-      "ExpectedInstructionCount": 8,
+      "ExpectedInstructionCount": 6,
       "Comment": [
         "Map 3 0b01 0x05 256-bit"
       ],
       "ExpectedArm64ASM": [
         "mov z2.q, z17.q[1]",
-        "mov v3.16b, v17.16b",
-        "mov v3.d[1], v17.d[1]",
-        "zip2 v2.2d, v2.2d, v2.2d",
+        "dup v2.2d, v2.d[1]",
         "mov z1.q, q2",
-        "mov z16.d, z3.d",
+        "mov z16.d, z17.d",
         "not p0.b, p7/z, p6.b",
         "mov z16.b, p0/m, z1.b"
       ]

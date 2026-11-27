@@ -1513,6 +1513,19 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
     // Special case element duplicate and broadcast to low or high 64-bits.
     return _VDupElement(OpSize::i128Bit, OpSize::i32Bit, Src, Shuffle & 0b11);
   }
+  case 0b00'00'01'00:
+  case 0b01'01'01'00:
+  case 0b10'10'01'00:
+  case 0b11'11'01'00: {
+    // Low 64-bits preserved, high 64-bits broadcast from selected element.
+    auto Dup = _VDupElement(OpSize::i128Bit, OpSize::i32Bit, Src, (Shuffle >> 4) & 0b11);
+    return _VZip(OpSize::i128Bit, OpSize::i64Bit, Src, Dup);
+  }
+  case 0b00'00'01'01: {
+    // Reverse bottom two elements and broadcast each to a 64-bit half.
+    Ref Tmp = _VZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
+    return _VExtr(OpSize::i128Bit, OpSize::i8Bit, Tmp, Tmp, 8);
+  }
   case 0b00'00'10'10: {
     // Weird reverse low elements and broadcast to each half of the register
     Ref Tmp = _VUnZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
@@ -1523,6 +1536,11 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
     // First element duplicated and shifted in to the top.
     auto Dup = _VDupElement(OpSize::i128Bit, OpSize::i32Bit, Src, 0);
     return _VExtr(OpSize::i128Bit, OpSize::i32Bit, Dup, Src, 2);
+  }
+  case 0b00'00'11'11: {
+    // Broadcast top element to low 64-bits and bottom element to high 64-bits.
+    Ref Tmp = _VExtr(OpSize::i128Bit, OpSize::i8Bit, Src, Src, 12);
+    return _VZip(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
   }
   case 0b00'01'00'01: {
     ///< Weird reversed low elements and broadcast
@@ -1564,6 +1582,14 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
     Tmp = _VZip2(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
     return _VExtr(OpSize::i128Bit, OpSize::i8Bit, Tmp, Tmp, 12);
   }
+  case 0b01'00'00'00:
+  case 0b01'00'01'01:
+  case 0b01'00'10'10:
+  case 0b01'00'11'11: {
+    // Low 64-bits broadcast from selected element, high 64-bits from low 64-bits.
+    auto Dup = _VDupElement(OpSize::i128Bit, OpSize::i32Bit, Src, Shuffle & 0b11);
+    return _VZip(OpSize::i128Bit, OpSize::i64Bit, Dup, Src);
+  }
   case 0b01'00'00'01: {
     ///< Weird duplicate bottom two elements, then rotate in the low half
     Ref Tmp = _VZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
@@ -1588,6 +1614,13 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
     Ref Tmp = _VExtr(OpSize::i128Bit, OpSize::i8Bit, Src, Src, 4);
     Tmp = _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
     return _VZip(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
+  }
+  case 0b01'01'11'10:
+  case 0b10'10'11'10:
+  case 0b11'11'11'10: {
+    // Low 64-bits from high 64-bits, high 64-bits broadcast from selected element.
+    auto Dup = _VDupElement(OpSize::i128Bit, OpSize::i32Bit, Src, (Shuffle >> 4) & 0b11);
+    return _VZip2(OpSize::i128Bit, OpSize::i64Bit, Src, Dup);
   }
   case 0b01'01'11'11: {
     ///< Weird reverse odd elements and broadcast to each half of the register
@@ -1692,6 +1725,14 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
   case 0b11'01'11'01:
     ///< Odd elements broadcast
     return _VUnZip2(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
+  case 0b11'10'00'00:
+  case 0b11'10'01'01:
+  case 0b11'10'10'10:
+  case 0b11'10'11'11: {
+    // Low 64-bits broadcast from selected element, high 64-bits preserved.
+    auto Dup = _VDupElement(OpSize::i128Bit, OpSize::i32Bit, Src, Shuffle & 0b11);
+    return _VZip2(OpSize::i128Bit, OpSize::i64Bit, Dup, Src);
+  }
   case 0b11'10'10'11: {
     ///< Rotate top two elements in to bottom half of the register
     Ref Tmp = _VZip2(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
@@ -1796,10 +1837,17 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
   const uint8_t ShiftAmount = std::popcount(SelectionMask);
 
   const auto SingleLane = [&](Ref LHS, Ref RHS, uint32_t LaneShuffle) -> Ref {
-    if (LHS == RHS && LaneShuffle == 0) {
-      // TODO: We can optimize significantly more shuffles when we know the sources match.
-      // Special case broadcast element 0.
-      return _VDupElement(DstSize, ElementSize, LHS, LaneShuffle & SelectionMask);
+    if (LHS == RHS) {
+      if (ElementSize == OpSize::i32Bit) {
+        return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
+      }
+      switch (LaneShuffle & 0b11) {
+      case 0b00:
+      case 0b11: return _VDupElement(OpSize::i128Bit, OpSize::i64Bit, LHS, LaneShuffle & 1);
+      case 0b01: return _VExtr(OpSize::i128Bit, OpSize::i8Bit, LHS, LHS, 8);
+      case 0b10: return LHS;
+      default: FEX_UNREACHABLE;
+      }
     }
     if (ElementSize == OpSize::i32Bit) {
       // We can shuffle optimally in a lot of cases.
@@ -1993,11 +2041,16 @@ void OpDispatchBuilder::SHUFOp(OpcodeArgs, IR::OpSize ElementSize) {
 }
 
 void OpDispatchBuilder::VSHUFOp(OpcodeArgs, IR::OpSize ElementSize) {
+  const auto DstSize = OpSizeFromDst(Op);
   Ref Src1Node = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
   Ref Src2Node = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
   uint8_t Shuffle = Op->Src[2].Literal();
 
-  Ref Result = SHUFOpImpl(OpSizeFromDst(Op), ElementSize, Src1Node, Src2Node, Shuffle);
+  Ref Result = SHUFOpImpl(DstSize, ElementSize, Src1Node, Src2Node, Shuffle);
+  if (DstSize == OpSize::i128Bit && Result == Src1Node) {
+    // Identity shuffle left the register untouched; explicitly zero upper AVX bits.
+    Result = _VMov(OpSize::i128Bit, Result);
+  }
   StoreResultFPR(Op, Result);
 }
 
@@ -5403,6 +5456,11 @@ void OpDispatchBuilder::VPERMILImmOp(OpcodeArgs, IR::OpSize ElementSize) {
     } else {
       Result = Single128Bit4ByteVectorShuffle(Src, Selector);
     }
+  }
+
+  if (!Is256Bit && Result == Src) {
+    // Identity shuffle left the register untouched; explicitly zero upper AVX bits.
+    Result = _VMov(OpSize::i128Bit, Result);
   }
 
   StoreResultFPR(Op, Result);
