@@ -63,10 +63,10 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
 
   if (DynamicL1Cache()) {
     // Start at minimum size when dynamic.
-    L1PointerMask = MIN_L1_ENTRIES - 1;
+    L1PointerMask = MIN_L1_SETS - 1;
   } else {
     // Start at maximum instead.
-    L1PointerMask = MAX_L1_ENTRIES - 1;
+    L1PointerMask = MAX_L1_SETS - 1;
   }
 
 #ifdef ARCHITECTURE_arm64
@@ -90,6 +90,81 @@ void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),
                                       ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, false);
   AllocateOffset = 0;
+}
+
+void LookupCache::UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddress, uint64_t HostCode) {
+  // If host pointer was found in L2 or L3, then add it to the counter.
+  // Keeping track not L1 misses, but specifically L2/L3 hits.
+  ++L2L3CacheHits;
+
+  // Only check the clock every SAMPLE_CHECK_STRIDE hits to keep L2/L3 lookups cheap.
+  if ((L2L3CacheHits & (SAMPLE_CHECK_STRIDE - 1)) != 0) {
+    return;
+  }
+
+  double AveragePerSecond {};
+#ifdef ARCHITECTURE_arm64
+  const uint64_t Freq = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency;
+  if (Freq == 0) [[unlikely]] {
+    return;
+  }
+
+  const uint64_t CurrentTicks = ReadSampleCounter();
+  const uint64_t ElapsedTicks = CurrentTicks - LastPeriodTicks;
+  const uint64_t SamplePeriodTicks = Freq * SamplePeriodSeconds;
+  if (ElapsedTicks < SamplePeriodTicks) {
+    return;
+  }
+
+  // Scale in double to avoid 64-bit integer overflow in L2L3CacheHits * Freq.
+  // ElapsedTicks >= SamplePeriodTicks >= Freq > 0 guarantees a positive divisor.
+  AveragePerSecond = (static_cast<double>(L2L3CacheHits) * static_cast<double>(Freq)) / static_cast<double>(ElapsedTicks);
+  LastPeriodTicks = CurrentTicks;
+#else
+  const auto CurrentTime = std::chrono::steady_clock::now();
+  const auto Period = CurrentTime - LastPeriod;
+  if (Period < SamplePeriod) {
+    return;
+  }
+
+  const auto ElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Period).count();
+  AveragePerSecond = static_cast<double>(L2L3CacheHits) / static_cast<double>(ElapsedMs) * 1000.0;
+  LastPeriod = CurrentTime;
+#endif
+
+  // If larger than the sample period then check if we need to increase L1 cache size.
+  if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
+    if (CurrentL1Entries < MAX_L1_ENTRIES) {
+      // Entries whose address has the new mask bit set would be unreachable by InvalidateCache
+      FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), CurrentL1Entries * sizeof(LookupCacheEntry), false);
+
+      CurrentL1Entries <<= 1;
+      L1PointerMask = (CurrentL1Entries / L1_WAYS) - 1;
+
+      // Update the thread's L1 pointer mask to increase how much cache it uses.
+      // Since we're in C-code, this is safe to update here.
+      Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+
+      // If L1 was just grown and cleared, re-insert our cached entry.
+      AddL1Entry(GuestAddress, HostCode);
+    }
+  } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
+    if (CurrentL1Entries > MIN_L1_ENTRIES) {
+      CurrentL1Entries >>= 1;
+      L1PointerMask = (CurrentL1Entries / L1_WAYS) - 1;
+
+      // Madvise the entries that we are dropping. Gives the memory back to the OS.
+      LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
+      size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
+      FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, false);
+
+      // Update the thread's L1 pointer mask to decrease how much cache it uses.
+      // Since we're in C-code, this is safe to update here.
+      Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+    }
+  }
+
+  L2L3CacheHits = 0;
 }
 
 void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {

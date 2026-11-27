@@ -215,20 +215,25 @@ DEF_OP(ExitFunction) {
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
     }
 
-    // L1 Cache
+    // 2-way set-associative L1 Cache
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-    // Calculate (tmp1 + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(ripreg) & L1_SETS_MASK) << 5)) for the 32-byte set.
     // L1Mask is pre-shifted.
     eor(ARMEmitter::Size::i64Bit, TMP3, RipReg, RipReg, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::L1Set)));
     add(TMP1, TMP1, TMP2);
 
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+    // Probe Way 0 (MRU). Note: sub+cbz used over cmp+br to preserve flags.
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP3, TMP1, 0);
+    sub(TMP3, TMP3, RipReg.X());
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &SkipFullLookup);
 
-    // Note: sub+cbnz used over cmp+br to preserve flags.
-    sub(TMP1, TMP1, RipReg.X());
-    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+    // Probe Way 1 in the same 64-byte cache line on Way 0 miss.
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP3, TMP1, sizeof(LookupCache::LookupCacheEntry));
+    sub(TMP3, TMP3, RipReg.X());
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &SkipFullLookup);
+
     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 

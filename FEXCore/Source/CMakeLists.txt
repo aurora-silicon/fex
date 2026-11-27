@@ -19,6 +19,7 @@ set(SRCS
   Common/JitSymbols.cpp
   Interface/Context/Context.cpp
   Interface/Core/LookupCache.cpp
+  Interface/Core/LookupBlockNoFP.cpp
   Interface/Core/DiskCache.cpp
   Interface/Core/CodeCache.cpp
   Interface/Core/Core.cpp
@@ -76,6 +77,10 @@ set(SRCS
 
 if (ARCHITECTURE_arm64)
   list(APPEND SRCS Utils/ArchHelpers/Arm64.cpp)
+  if (NOT ARCHITECTURE_arm64ec AND NOT ENABLE_VIXL_SIMULATOR AND NOT MINGW)
+    set_source_files_properties(Interface/Core/LookupBlockNoFP.cpp PROPERTIES
+      COMPILE_OPTIONS "-mgeneral-regs-only;-mno-outline-atomics")
+  endif()
 else()
   list(APPEND SRCS Utils/ArchHelpers/Arm64_stubs.cpp)
 endif()

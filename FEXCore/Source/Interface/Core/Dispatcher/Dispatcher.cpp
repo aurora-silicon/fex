@@ -75,6 +75,9 @@ void Dispatcher::EmitDispatcher() {
   ARMEmitter::ForwardLabel l_CTX;
   ARMEmitter::ForwardLabel l_Sleep;
   ARMEmitter::ForwardLabel l_CompileBlock;
+#if !defined(_WIN32) && !defined(ARCHITECTURE_arm64ec) && !defined(VIXL_SIMULATOR) && defined(ARCHITECTURE_arm64)
+  ARMEmitter::ForwardLabel l_LookupBlockNoFP;
+#endif
   ARMEmitter::ForwardLabel l_CompileSingleStep;
 
   // Push all the register we need to save
@@ -224,16 +227,17 @@ void Dispatcher::EmitDispatcher() {
 
       // If we've made it here then we have a real compiled block
       {
-        // update L1 cache
-        // Calculate (L1Pointer + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address.
+        // update 2-way L1 cache (Way 0 only here; lockless path must not copy Way 0 -> Way 1
+        // to avoid resurrecting an entry concurrently cleared by cross-thread InvalidateCache).
+        // Calculate (L1Pointer + ((HashL1Index(ripreg) & L1_SETS_MASK) << 5)) for the 32-byte set.
         // L1Mask is pre-shifted; TMP3 (RipReg) and TMP4 (HostCode) are live across this update.
         eor(ARMEmitter::Size::i64Bit, TMP1, RipReg.R(), RipReg.R(), ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
         ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::L1Set)));
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
         add(TMP1, TMP1, TMP2);
 
-        stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
+        stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1, 0);
 
         // Jump to the block
         br(TMP4);
@@ -326,16 +330,81 @@ void Dispatcher::EmitDispatcher() {
   {
     (void)Bind(&NoBlock);
 
-    EmitSignalGuardedRegion([&]() {
-      SpillStaticRegs(TMP1);
+#if !defined(_WIN32) && !defined(ARCHITECTURE_arm64ec) && !defined(VIXL_SIMULATOR) && defined(ARCHITECTURE_arm64)
+    // Fast NoFP/NoSIMD L3 lookup path: avoids spilling/filling static FPRs (v16..v31) and
+    // serializing FPCR.AFP updates on L1 conflict misses that hit L3 (Shared->BlockList).
+    // Disable when SVE is active (AAPCS64 C++ calls do not preserve SVE predicate/upper-Z state)
+    // or when JIT entrypoints do not emit pending interrupt fault checks.
+    if (!CTX->HostFeatures.SupportsSVE() && CTX->Config.NeedsPendingInterruptFaultCheck) {
+      // Defer async guest signals across spill, LookupBlockNoFP, and refill.
+      ldr(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+      add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+      str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
 
-      if (!TMP_ABIARGS) {
-        mov(ARMEmitter::XReg::x2, RipReg);
-      }
+      // Spill static GPRs, NZCV, PF/AF, and callret_sp only (keep v16..v31 and FPCR intact).
+      // SpillStaticRegs only clobbers TMP1 (x0); RipReg (x2) remains valid.
+      SpillStaticRegs(TMP1, {
+                              .FPRs = false,
+                              .FPCR = false,
+                            });
+
+      // Mark InSyscallInfo so Pause/Stop/GDB signals know GPRs are already in Frame->State
+      // while static FPRs (v16..v31) remain live in hardware registers / ucontext.
+      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, 0xFFFFULL | FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED);
+      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
 
       ldr(ARMEmitter::XReg::x0, &l_CTX);
       mov(ARMEmitter::XReg::x1, STATE);
-      // x2 contains guest RIP
+      // x2 (RipReg) already contains guest RIP
+      ldr(ARMEmitter::XReg::x4, &l_LookupBlockNoFP);
+      if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+        GenerateIndirectRuntimeCall<uintptr_t, void*, void*, uint64_t>(ARMEmitter::Reg::r4);
+      } else {
+        blr(ARMEmitter::Reg::r4); // { CTX, Frame, RIP }
+      }
+
+      ARMEmitter::ForwardLabel SlowCompileBlock;
+      (void)cbz(ARMEmitter::Size::i64Bit, ARMEmitter::XReg::x0, &SlowCompileBlock);
+
+      // Fast hit: x0 holds compiled block EntryPoint. Refill static GPRs/NZCV/PF/AF/callret_sp
+      // using x1/x2 as temps so x0 is preserved; FPRs and FPCR were never touched.
+      FillStaticRegs({
+        .OptionalReg = ARMEmitter::Reg::r1,
+        .OptionalReg2 = ARMEmitter::Reg::r2,
+        .FPRs = false,
+        .FPCR = false,
+      });
+
+      // All static GPRs and FPRs are live in host registers again.
+      str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+      // Decrement DeferredSignalRefCount without faulting inside the dispatcher: Frame->State.xmm
+      // was never spilled on this NoFP path, whereas SignalDelegator assumes dispatcher signals
+      // with InSyscallInfo == 0 hold synced guest state in both Frame->State and registers.
+      // Every Shared->BlockList entry is a JIT EntryPoint that executes EmitPendingInterruptFaultCheck()
+      // immediately on entry with WasInJIT == true.
+      ldr(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+      sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+      str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+
+      br(ARMEmitter::XReg::x0);
+
+      // Slow path: finish spilling static FPRs and disabling FPCR.AFP, then call CompileBlock.
+      (void)Bind(&SlowCompileBlock);
+      SpillStaticRegs(TMP1, {
+                              .GPRSpillMask = 0,
+                              .FPRs = true,
+                              .NZCV = false,
+                              .FPCR = true,
+                            });
+
+      // Clear InSyscallInfo now that both GPRs and FPRs are spilled and AFP is disabled.
+      str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+      // Reload guest RIP (x2 was clobbered by LookupBlockNoFP).
+      ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, State.rip));
+      ldr(ARMEmitter::XReg::x0, &l_CTX);
+      mov(ARMEmitter::XReg::x1, STATE);
       mov(ARMEmitter::XReg::x3, 0);
       ldr(ARMEmitter::XReg::x4, &l_CompileBlock);
 
@@ -345,16 +414,49 @@ void Dispatcher::EmitDispatcher() {
         blr(ARMEmitter::Reg::r4); // { CTX, Frame, RIP, MaxInst }
       }
 
-      // Result is now in x0
-      if (!TMP_ABIARGS) {
-        mov(TMP1, ARMEmitter::XReg::x0);
-      }
-
+      // Result is now in x0 (TMP1).
       FillStaticRegs();
-    });
 
-    // Jump to the compiled block
-    br(TMP1);
+      ldr(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+      sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+      str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+
+      EmitPendingInterruptFaultCheck();
+
+      br(TMP1);
+    } else
+#endif
+    {
+      EmitSignalGuardedRegion([&]() {
+        SpillStaticRegs(TMP1);
+
+        if (!TMP_ABIARGS) {
+          mov(ARMEmitter::XReg::x2, RipReg);
+        }
+
+        ldr(ARMEmitter::XReg::x0, &l_CTX);
+        mov(ARMEmitter::XReg::x1, STATE);
+        // x2 contains guest RIP
+        mov(ARMEmitter::XReg::x3, 0);
+        ldr(ARMEmitter::XReg::x4, &l_CompileBlock);
+
+        if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+          GenerateIndirectRuntimeCall<uintptr_t, void*, void*, uint64_t, uint64_t>(ARMEmitter::Reg::r4);
+        } else {
+          blr(ARMEmitter::Reg::r4); // { CTX, Frame, RIP, MaxInst }
+        }
+
+        // Result is now in x0
+        if (!TMP_ABIARGS) {
+          mov(TMP1, ARMEmitter::XReg::x0);
+        }
+
+        FillStaticRegs();
+      });
+
+      // Jump to the compiled block
+      br(TMP1);
+    }
   }
 
   {
@@ -571,16 +673,22 @@ void Dispatcher::EmitDispatcher() {
       add(ARMEmitter::Size::i64Bit, TMP3, TMP3, rip_offset);
     }
 
-    // Calculate (tmp1 + ((HashL1Index(tmp3) & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(tmp3) & L1_SETS_MASK) << 5)) for the 32-byte set.
     // L1Mask is pre-shifted.
     eor(ARMEmitter::Size::i64Bit, TMP4, TMP3, TMP3, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::L1Set)));
     add(TMP1, TMP1, TMP2);
 
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+    ARMEmitter::ForwardLabel L1Hit;
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP4, TMP1, 0);
+    sub(TMP4, TMP4, TMP3);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &L1Hit);
 
-    sub(TMP1, TMP1, TMP3);
-    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &LoopTop);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP4, TMP1, sizeof(LookupCache::LookupCacheEntry));
+    sub(TMP4, TMP4, TMP3);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP4, &LoopTop);
+
+    (void)Bind(&L1Hit);
     br(TMP2);
   };
 
@@ -941,6 +1049,11 @@ void Dispatcher::EmitDispatcher() {
   (void)Bind(&l_CompileBlock);
   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileBlock(&FEXCore::Context::ContextImpl::CompileBlock);
   dc64(PMFCompileBlock.GetConvertedPointer());
+#if !defined(_WIN32) && !defined(ARCHITECTURE_arm64ec) && !defined(VIXL_SIMULATOR) && defined(ARCHITECTURE_arm64)
+  (void)Bind(&l_LookupBlockNoFP);
+  FEXCore::Utils::MemberFunctionToPointerCast PMFLookupBlockNoFP(&FEXCore::Context::ContextImpl::LookupBlockNoFP);
+  dc64(PMFLookupBlockNoFP.GetConvertedPointer());
+#endif
   (void)Bind(&l_CompileSingleStep);
 
   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileSingleStep(&FEXCore::Context::ContextImpl::CompileSingleStep);

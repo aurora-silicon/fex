@@ -432,6 +432,7 @@ public:
   [[nodiscard]]
   CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);
   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+  uintptr_t LookupBlockNoFP(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 
   // Drops lookup data and block links of every CodeBuffer generation older than the latest one and

@@ -261,6 +261,38 @@ public:
     return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
   }
 
+  // Non-blocking shared lock without assertions or logging, safe to call from NoFP/NoSIMD code.
+#if defined(__clang__) || defined(__GNUC__)
+  __attribute__((always_inline))
+#endif
+  bool TryLockSharedNoFP() {
+    auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+    uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
+
+    if ((Expected & WRITE_OWNED_BIT) || (Expected & WRITE_WAITER_COUNT_MASK)) {
+      return false;
+    }
+
+    uint32_t Desired = Expected + READ_OWNER_INCREMENT;
+    if ((Desired & READ_OWNER_COUNT_MASK) == 0) {
+      return false;
+    }
+
+    return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+  }
+
+  // Shared unlock without assertions, logging, or libc/PLT calls, safe to call from NoFP/NoSIMD code.
+#if defined(__clang__) || defined(__GNUC__)
+  __attribute__((always_inline))
+#endif
+  void UnlockSharedNoFP() {
+    auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+    const uint32_t Desired = AtomicFutex.fetch_sub(READ_OWNER_INCREMENT) - READ_OWNER_INCREMENT;
+    if ((Desired & WRITE_WAITER_COUNT_MASK) && (Desired & READ_OWNER_COUNT_MASK) == 0) {
+      FutexWakeWriterNoFP();
+    }
+  }
+
 #if !defined(_WIN32)
   // Initialize the internal mutex object to its default initializer state.
   // Should only ever be used in the child process when a Linux fork() has occured.
@@ -293,6 +325,24 @@ private:
     // Wake all readers.
     ::syscall(SYS_futex, &Futex, FUTEX_PRIVATE_FLAG | FUTEX_WAKE_BITSET, INT_MAX, nullptr, nullptr, FUTEX_BITSET_WAIT_READERS);
   }
+
+#if defined(__clang__) || defined(__GNUC__)
+  __attribute__((always_inline))
+#endif
+  void FutexWakeWriterNoFP() {
+#if defined(ARCHITECTURE_arm64)
+    register uint64_t x0 __asm__("x0") = reinterpret_cast<uint64_t>(&Futex);
+    register uint64_t x1 __asm__("x1") = FUTEX_PRIVATE_FLAG | FUTEX_WAKE_BITSET;
+    register uint64_t x2 __asm__("x2") = 1;
+    register uint64_t x3 __asm__("x3") = 0;
+    register uint64_t x4 __asm__("x4") = 0;
+    register uint64_t x5 __asm__("x5") = FUTEX_BITSET_WAIT_WRITERS;
+    register uint64_t x8 __asm__("x8") = SYS_futex;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8) : "memory");
+#else
+    FutexWakeWriter();
+#endif
+  }
 #else
   // Writers wait for the full 32-bit futex.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
@@ -308,6 +358,13 @@ private:
 
   void FutexWakeWriter() {
     WakeByAddressSingle(&Futex);
+  }
+
+#if defined(__clang__) || defined(__GNUC__)
+  __attribute__((always_inline))
+#endif
+  void FutexWakeWriterNoFP() {
+    FutexWakeWriter();
   }
 
   void FutexWakeReaders() {
