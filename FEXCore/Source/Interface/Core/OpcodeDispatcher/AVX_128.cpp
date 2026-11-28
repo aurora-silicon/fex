@@ -884,8 +884,9 @@ void OpDispatchBuilder::AVX128_MOVMSKB(OpcodeArgs) {
   auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
   Ref VMask = LoadAndCacheNamedVectorConstant(OpSize::i128Bit, NAMED_VECTOR_MOVMASKB);
 
-  auto Mask1Byte = [this](Ref Src, Ref VMask) {
-    auto VCMP = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src);
+  Ref Result;
+  if (Is128Bit) {
+    auto VCMP = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src.Low);
     auto VAnd = _VAnd(OpSize::i128Bit, VCMP, VMask);
 
     auto VAdd1 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAnd, VAnd);
@@ -893,14 +894,20 @@ void OpDispatchBuilder::AVX128_MOVMSKB(OpcodeArgs) {
     auto VAdd3 = _VAddP(OpSize::i64Bit, OpSize::i8Bit, VAdd2, VAdd2);
 
     ///< 16-bits of data per 128-bit
-    return _VExtractToGPR(OpSize::i128Bit, OpSize::i16Bit, VAdd3, 0);
-  };
+    Result = _VExtractToGPR(OpSize::i128Bit, OpSize::i16Bit, VAdd3, 0);
+  } else {
+    auto VCMPLow = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src.Low);
+    auto VAndLow = _VAnd(OpSize::i128Bit, VCMPLow, VMask);
 
-  Ref Result = Mask1Byte(Src.Low, VMask);
+    auto VCMPHigh = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src.High);
+    auto VAndHigh = _VAnd(OpSize::i128Bit, VCMPHigh, VMask);
 
-  if (!Is128Bit) {
-    auto ResultHigh = Mask1Byte(Src.High, VMask);
-    Result = _Orlshl(OpSize::i64Bit, Result, ResultHigh, 16);
+    // Fuse low and high halves through one pairwise-add chain and a single SIMD->GPR extract.
+    auto VAdd1 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAndLow, VAndHigh);
+    auto VAdd2 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAdd1, VAdd1);
+    auto VAdd3 = _VAddP(OpSize::i64Bit, OpSize::i8Bit, VAdd2, VAdd2);
+
+    Result = _VExtractToGPR(OpSize::i128Bit, OpSize::i32Bit, VAdd3, 0);
   }
 
   StoreResultGPR(Op, Result);
