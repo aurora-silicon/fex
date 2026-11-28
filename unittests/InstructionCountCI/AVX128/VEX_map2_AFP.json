@@ -266,6 +266,135 @@
         "fnmadd d16, d17, d18, d16",
         "stp xzr, xzr, [x28, #192]"
       ]
+    },
+    "vfmadd231ss xmm0, xmm0, xmm1": {
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Map 2 0b01 0xb9 128-bit Dst == Vector1 == Addend"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s16, s17, s16",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd231sd xmm0, xmm0, xmm1": {
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Map 2 0b01 0xb9 128-bit Dst == Vector1 == Addend"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd d16, d16, d17, d16",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd231ss xmm0, xmm1, xmm0": {
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Map 2 0b01 0xb9 128-bit Dst == Vector2 == Addend"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s17, s16, s16",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd132ss xmm0, xmm0, xmm2": {
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Map 2 0b01 0x99 128-bit Upper == Addend"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s16, s18, s16",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd213ss xmm0, xmm1, xmm0": {
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Map 2 0b01 0xa9 128-bit Upper == Addend"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s17, s16, s16",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd231ss untied Dst != Upper": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Dst != Upper with Upper == Addend collapses mov + fmadd + ins into single fmadd"
+      ],
+      "x86Insts": [
+        "vmovaps xmm0, xmm1",
+        "vfmadd231ss xmm0, xmm2, xmm3"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s18, s19, s17",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd231sd untied Dst != Upper": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Dst != Upper with Upper == Addend collapses mov + fmadd + ins into single fmadd"
+      ],
+      "x86Insts": [
+        "vmovaps xmm0, xmm1",
+        "vfmadd231sd xmm0, xmm2, xmm3"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd d16, d18, d19, d17",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd231ss untied Dst != Upper, Vector1 == Addend": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Dst != Upper with Upper == Addend == Vector1 collapses to single fmadd"
+      ],
+      "x86Insts": [
+        "vmovaps xmm0, xmm1",
+        "vfmadd231ss xmm0, xmm0, xmm2"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s17, s18, s17",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd132ss untied Dst != Upper (Upper != Addend)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 4,
+      "Comment": [
+        "Upper != Addend must keep temp fmadd + mov + ins"
+      ],
+      "x86Insts": [
+        "vmovaps xmm0, xmm1",
+        "vfmadd132ss xmm0, xmm2, xmm3"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s0, s17, s19, s18",
+        "mov v16.16b, v17.16b",
+        "mov v16.s[0], v0.s[0]",
+        "stp xzr, xzr, [x28, #192]"
+      ]
+    },
+    "vfmadd213ss untied Dst != Upper (Upper != Addend)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 4,
+      "Comment": [
+        "Upper != Addend must keep temp fmadd + mov + ins"
+      ],
+      "x86Insts": [
+        "vmovaps xmm0, xmm1",
+        "vfmadd213ss xmm0, xmm2, xmm3"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s0, s18, s17, s19",
+        "mov v16.16b, v17.16b",
+        "mov v16.s[0], v0.s[0]",
+        "stp xzr, xzr, [x28, #192]"
+      ]
     }
   }
 }

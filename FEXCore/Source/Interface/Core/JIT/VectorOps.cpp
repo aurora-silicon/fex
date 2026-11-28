@@ -269,24 +269,22 @@ void Arm64JITCore::VFScalarFMAOperation(IR::OpSize OpSize, IR::OpSize ElementSiz
 
   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit || ElementSize == IR::OpSize::i64Bit, "Invalid "
                                                                                                                                   "size");
+  if (HostSupportsAFP && Upper == Addend) {
+    // Under FEAT_AFP (FPCR.NEP == 1), 3-input scalar FMA copies upper bits [127:esize] directly from Va (Addend).
+    ScalarEmit(Dst, Vector1, Vector2, Addend);
+    return;
+  }
+
   const auto SubRegSize = ARMEmitter::ToVectorSizePair(ElementSize == IR::OpSize::i16Bit ? ARMEmitter::SubRegSize::i16Bit :
                                                        ElementSize == IR::OpSize::i32Bit ? ARMEmitter::SubRegSize::i32Bit :
                                                                                            ARMEmitter::SubRegSize::i64Bit);
 
+  // Either AFP is unavailable or Upper != Addend; emit into a temporary first so Dst aliasing inputs cannot clobber them.
+  ScalarEmit(VTMP1, Vector1, Vector2, Addend);
   if (Dst != Upper) {
-    // If destination is not tied, move the upper bits to the destination first.
     mov(Dst.Q(), Upper.Q());
   }
-
-  if (HostSupportsAFP && Dst == Addend) {
-    ///< Exactly matches ARM scalar FMA semantics
-    // If the host CPU supports AFP then scalar does an insert without modifying upper bits.
-    ScalarEmit(Dst, Vector1, Vector2, Addend);
-  } else {
-    // Host doesn't support AFP, need to emit in to a temporary then insert.
-    ScalarEmit(VTMP1, Vector1, Vector2, Addend);
-    ins(SubRegSize.Vector, Dst.Q(), 0, VTMP1.Q(), 0);
-  }
+  ins(SubRegSize.Vector, Dst.Q(), 0, VTMP1.Q(), 0);
 }
 
 // VFScalarOperation performs the operation described through ScalarEmit between Vector1 and Vector2,
@@ -294,7 +292,8 @@ void Arm64JITCore::VFScalarFMAOperation(IR::OpSize OpSize, IR::OpSize ElementSiz
 // The result is stored into the destination. The untouched bits of the destination come from Vector1, unless it's a 256 vector
 // and ZeroUpperBits is true, in which case the upper bits are zero.
 void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize, bool ZeroUpperBits, ScalarBinaryOpCaller ScalarEmit,
-                                     ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1, ARMEmitter::VRegister Vector2) {
+                                     ARMEmitter::VRegister Dst, ARMEmitter::VRegister Vector1, ARMEmitter::VRegister Vector2,
+                                     bool HardwareMergesUpper) {
   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
   LOGMAN_THROW_A_FMT(!Is256Bit || HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
   LOGMAN_THROW_A_FMT(Is256Bit || !ZeroUpperBits, "128-bit operation doesn't support ZeroUpperBits in {}", __func__);
@@ -303,6 +302,13 @@ void Arm64JITCore::VFScalarOperation(IR::OpSize OpSize, IR::OpSize ElementSize, 
   // The upper bits of the destination comes from Vector1.
   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit || ElementSize == IR::OpSize::i64Bit, "Invalid "
                                                                                                                                   "size");
+  if (HostSupportsAFP && HardwareMergesUpper && (!Is256Bit || ZeroUpperBits)) {
+    // Under FEAT_AFP (FPCR.NEP == 1), supported 2-input scalar FP ops copy upper bits [127:esize]
+    // directly from Vector1 into Dst (and zero [VL-1:128] on SVE), regardless of register aliasing.
+    ScalarEmit(Dst, Vector1, Vector2);
+    return;
+  }
+
   const auto SubRegSize = ARMEmitter::ToVectorSizePair(ElementSize == IR::OpSize::i16Bit ? ARMEmitter::SubRegSize::i16Bit :
                                                        ElementSize == IR::OpSize::i32Bit ? ARMEmitter::SubRegSize::i32Bit :
                                                                                            ARMEmitter::SubRegSize::i64Bit);
@@ -921,7 +927,11 @@ DEF_OP(VFCMPScalarInsert) {
   const auto Vector1 = GetVReg(Op->Vector1);
   const auto Vector2 = GetVReg(Op->Vector2);
 
-  VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, Funcs[FEXCore::ToUnderlying(Op->Op)], Dst, Vector1, Vector2);
+  // EQ/LT/LE emit a single scalar FCMEQ/FCMGT/FCMGE with Src1 as Vm, which copies upper bits
+  // [127:esize] from Vm under FPCR.NEP == 1. UNO/NEQ/ORD compute into VTMP1/VTMP2 and insert.
+  const bool HardwareMergesUpper = Op->Op == IR::FloatCompareOp::EQ || Op->Op == IR::FloatCompareOp::LT || Op->Op == IR::FloatCompareOp::LE;
+
+  VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, Funcs[FEXCore::ToUnderlying(Op->Op)], Dst, Vector1, Vector2, HardwareMergesUpper);
 }
 
 DEF_OP(VectorImm) {
