@@ -58,6 +58,7 @@ void x64SyscallHandler::RegisterSyscallHandlers() {
 #endif
   };
   std::fill(Definitions.begin() + SYSCALL_GAP_BEGIN, Definitions.begin() + SYSCALL_GAP_END, InvalidSyscall);
+  std::fill(DirectPassthroughTable.begin() + SYSCALL_GAP_BEGIN, DirectPassthroughTable.begin() + SYSCALL_GAP_END, int16_t {-1});
 
 #if PRINT_MISSING_SYSCALLS
   for (auto& Syscall : SyscallNames) {

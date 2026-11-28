@@ -76,6 +76,7 @@ void Dispatcher::EmitDispatcher() {
   ARMEmitter::ForwardLabel l_Sleep;
   ARMEmitter::ForwardLabel l_CompileBlock;
   ARMEmitter::ForwardLabel l_CompileSingleStep;
+  ARMEmitter::ForwardLabel l_DirectTable;
 
   // Push all the register we need to save
   PushCalleeSavedRegisters();
@@ -584,33 +585,30 @@ void Dispatcher::EmitDispatcher() {
     br(TMP2);
   };
 
+#if !defined(_WIN32) && !defined(ARCHITECTURE_arm64ec) && !defined(VIXL_SIMULATOR)
+  // Disable when SVE is active: raw ARM64 Linux svc #0 discards SVE predicate and upper Z state.
+  const std::span<const int16_t> DirectTable =
+    (!CTX->HostFeatures.SupportsSVE() && CTX->Config.Is64BitMode && CTX->SyscallHandler) ?
+      CTX->SyscallHandler->GetDirectPassthroughTable() :
+      std::span<const int16_t> {};
+  const bool EnableDirectPassthrough = !DirectTable.empty();
+#else
+  const std::span<const int16_t> DirectTable {};
+  constexpr bool EnableDirectPassthrough = false;
+#endif
+
   {
     // Dynamic registers are dead and stack is reset coming into this handler.
     // Static registers are spilled here so direct-passthrough syscalls can avoid
     // spilling/filling static FPRs (v16..v31) and serializing FPCR updates.
     ThreadDispatchSyscallHandler = GetCursorAddress<uint64_t>();
 
-#if !defined(_WIN32) && !defined(ARCHITECTURE_arm64ec) && !defined(VIXL_SIMULATOR)
-    // Disable when SVE is active: raw ARM64 Linux svc #0 discards SVE predicate and upper Z state.
-    const bool EnableDirectPassthrough = !CTX->HostFeatures.SupportsSVE() && CTX->Config.Is64BitMode && CTX->SyscallHandler &&
-                                         CTX->SyscallHandler->SupportsDirectSyscallPassthrough();
-#else
-    constexpr bool EnableDirectPassthrough = false;
-#endif
-
     if (EnableDirectPassthrough) {
-      constexpr uint64_t X64_SYS_IOCTL = 16;
-      constexpr uint64_t X64_SYS_SCHED_YIELD = 24;
-      constexpr uint64_t X64_SYS_FUTEX = 202;
       constexpr uint64_t X64_IOCTL_TYPE_UFFDIO = 0xAA;
-
       constexpr uint64_t ARM64_SYS_IOCTL = 29;
-      constexpr uint64_t ARM64_SYS_FUTEX = 98;
-      constexpr uint64_t ARM64_SYS_SCHED_YIELD = 124;
+      static_assert(FEXCore::HLE::SyscallHandler::DIRECT_PASSTHROUGH_IOCTL == -2);
 #if !defined(_WIN32) && defined(ARCHITECTURE_arm64)
       static_assert(ARM64_SYS_IOCTL == SYS_ioctl);
-      static_assert(ARM64_SYS_FUTEX == SYS_futex);
-      static_assert(ARM64_SYS_SCHED_YIELD == SYS_sched_yield);
 #endif
 
       // Spill static GPRs, NZCV, PF/AF, and callret_sp first (no FPR spill, no FPCR touch).
@@ -634,40 +632,28 @@ void Dispatcher::EmitDispatcher() {
       }
 
       ARMEmitter::ForwardLabel SlowPath;
-      ARMEmitter::ForwardLabel FastIoctl;
-      ARMEmitter::ForwardLabel FastFutex;
-      ARMEmitter::ForwardLabel FastSchedYield;
-      ARMEmitter::ForwardLabel FastDoSvc;
+      ARMEmitter::ForwardLabel SpecialOrSlow;
+      ARMEmitter::BackwardLabel FastDoSvc;
 
       // Fall back to the full C++ syscall handler whenever emulated seccomp filters are active.
       ldr(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, HasSeccompFilter));
       (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &SlowPath);
 
+      // O(1) lookup in the x86-64 -> ARM64 direct-passthrough syscall table.
       // Read guest RAX from Frame->State (authoritative after any deferred signal delivery).
       ldr(TMP1, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RAX));
-      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_SYS_IOCTL);
-      (void)b(ARMEmitter::Condition::CC_EQ, &FastIoctl);
-      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_SYS_FUTEX);
-      (void)b(ARMEmitter::Condition::CC_EQ, &FastFutex);
-      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_SYS_SCHED_YIELD);
-      (void)b(ARMEmitter::Condition::CC_EQ, &FastSchedYield);
-      (void)b(&SlowPath);
-
-      (void)Bind(&FastIoctl);
-      // Userfaultfd ioctls (_IOC_TYPE(request) == UFFDIO) need FEX emulation.
-      ldr(TMP1, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RSI));
-      ubfx(ARMEmitter::Size::i64Bit, TMP1, TMP1, 8, 8);
-      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_IOCTL_TYPE_UFFDIO);
-      (void)b(ARMEmitter::Condition::CC_EQ, &SlowPath);
-      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_IOCTL);
-      (void)b(&FastDoSvc);
-
-      (void)Bind(&FastFutex);
-      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_FUTEX);
-      (void)b(&FastDoSvc);
-
-      (void)Bind(&FastSchedYield);
-      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_SCHED_YIELD);
+      if (DirectTable.size() <= 4095) {
+        cmp(ARMEmitter::Size::i64Bit, TMP1, static_cast<uint32_t>(DirectTable.size()));
+      } else {
+        LoadConstant(ARMEmitter::Size::i64Bit, TMP2, DirectTable.size());
+        cmp(ARMEmitter::Size::i64Bit, TMP1, TMP2);
+      }
+      (void)b(ARMEmitter::Condition::CC_HS, &SlowPath);
+      ldr(TMP2, &l_DirectTable);
+      ldrsh(ARMEmitter::XReg::x8, TMP2, TMP1, ARMEmitter::ExtendedType::LSL_64, 1);
+      // Non-negative entries hold the ARM64 syscall number directly in x8; negative entries
+      // are either DIRECT_PASSTHROUGH_IOCTL (-2) or slow-path (-1).
+      (void)tbnz(ARMEmitter::XReg::x8, 63, &SpecialOrSlow);
 
       (void)Bind(&FastDoSvc);
       // Load x86-64 syscall arguments from Frame->State.gregs (after EmitPendingInterruptFaultCheck
@@ -722,6 +708,19 @@ void Dispatcher::EmitDispatcher() {
       }
 
       EmitL1Lookup();
+
+      // Out-of-line negative-entry dispatch: DIRECT_PASSTHROUGH_IOCTL (-2) runs the inline
+      // UFFDIO check and branches back to FastDoSvc; all other negative entries (-1) fall through.
+      (void)Bind(&SpecialOrSlow);
+      cmn(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r8, 2);
+      (void)b(ARMEmitter::Condition::CC_NE, &SlowPath);
+      // Userfaultfd ioctls (_IOC_TYPE(request) == UFFDIO) need FEX emulation.
+      ldr(TMP1, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RSI));
+      ubfx(ARMEmitter::Size::i64Bit, TMP1, TMP1, 8, 8);
+      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_IOCTL_TYPE_UFFDIO);
+      (void)b(ARMEmitter::Condition::CC_EQ, &SlowPath);
+      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_IOCTL);
+      (void)b(&FastDoSvc);
 
       // Slow path: finish spilling static FPRs and disabling AFP in FPCR before calling C++.
       (void)Bind(&SlowPath);
@@ -945,6 +944,10 @@ void Dispatcher::EmitDispatcher() {
 
   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileSingleStep(&FEXCore::Context::ContextImpl::CompileSingleStep);
   dc64(PMFCompileSingleStep.GetConvertedPointer());
+  if (EnableDirectPassthrough) {
+    (void)Bind(&l_DirectTable);
+    dc64(reinterpret_cast<uintptr_t>(DirectTable.data()));
+  }
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();

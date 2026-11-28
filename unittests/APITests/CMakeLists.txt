@@ -20,6 +20,11 @@ foreach(API_TEST ${TESTS})
     TEST_SUFFIX ".${API_TEST}.APITest")
 endforeach()
 
+add_executable(DirectSyscallPassthrough DirectSyscallPassthrough.cpp)
+target_link_libraries(DirectSyscallPassthrough PRIVATE ${LIBS} CommonTools LinuxEmulation Catch2::Catch2WithMain)
+catch_discover_tests(DirectSyscallPassthrough
+  TEST_SUFFIX ".DirectSyscallPassthrough.APITest")
+
 add_custom_target(api_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
   USES_TERMINAL
@@ -28,3 +33,4 @@ add_custom_target(api_tests
 foreach(API_TEST ${TESTS})
   add_dependencies(api_tests ${API_TEST})
 endforeach()
+add_dependencies(api_tests DirectSyscallPassthrough)

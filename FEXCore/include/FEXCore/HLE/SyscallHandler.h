@@ -2,6 +2,7 @@
 #pragma once
 #include <cstdint>
 #include <optional>
+#include <span>
 
 #include <FEXCore/Core/CodeCache.h>
 #include <FEXCore/IR/IR.h>
@@ -34,11 +35,17 @@ public:
 
   virtual void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) = 0;
 
-  /// Returns true if the frontend supports the dispatcher's direct ARM64 Linux kernel
-  /// passthrough fast path for x86-64 ioctl (non-UFFDIO), futex, and sched_yield syscalls
-  /// when no seccomp filter is installed on the calling thread.
-  virtual bool SupportsDirectSyscallPassthrough() const {
-    return false;
+  /// Sentinel value in the direct-passthrough syscall table indicating x86-64 ioctl,
+  /// which requires an inline UFFDIO check before issuing ARM64 ioctl.
+  static constexpr int16_t DIRECT_PASSTHROUGH_IOCTL = -2;
+
+  /// Returns a lookup table indexed by x86-64 syscall number mapping to the corresponding
+  /// ARM64 Linux kernel syscall number (>= 0), DIRECT_PASSTHROUGH_IOCTL (-2) for inline
+  /// non-UFFDIO ioctl passthrough, or -1 to fall back to HandleSyscall.
+  /// Returns an empty span when direct passthrough is unsupported (32-bit, non-Linux,
+  /// non-ARM64, or DEBUG_STRACE builds).
+  virtual std::span<const int16_t> GetDirectPassthroughTable() const {
+    return {};
   }
 
   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}

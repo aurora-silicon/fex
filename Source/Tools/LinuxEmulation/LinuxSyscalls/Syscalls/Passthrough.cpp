@@ -6,6 +6,7 @@ tags: LinuxSyscalls|syscalls-shared
 $end_info$
 */
 
+#include "LinuxSyscalls/Arm64/SyscallsEnum.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
 #include "LinuxSyscalls/x32/Syscalls.h"
@@ -282,49 +283,84 @@ static uint64_t IOUringSetupRestricted(FEXCore::Core::CpuStateFrame* Frame, uint
 }
 #endif
 
+// Conservatively exclude signal-sending syscalls from the NoFP direct-passthrough fast path
+// so explicit signal dispatch stays on the C++ slow path.
+constexpr int16_t DirectPassthroughNumber(int X64SyscallNumber, int Arm64SyscallNumber) {
+  if (Arm64SyscallNumber < 0 || Arm64SyscallNumber >= FEX::HLE::Arm64::SYSCALL_Arm64_MAX) {
+    return -1;
+  }
+  switch (X64SyscallNumber) {
+  case FEX::HLE::x64::SYSCALL_x64_kill:
+  case FEX::HLE::x64::SYSCALL_x64_tkill:
+  case FEX::HLE::x64::SYSCALL_x64_tgkill:
+  case FEX::HLE::x64::SYSCALL_x64_rt_sigqueueinfo:
+  case FEX::HLE::x64::SYSCALL_x64_rt_tgsigqueueinfo:
+  case FEX::HLE::x64::SYSCALL_x64_pidfd_send_signal: return -1;
+  default: return static_cast<int16_t>(Arm64SyscallNumber);
+  }
+}
+
+#define REGISTER_PASSTHROUGH_COMMON(name, nargs)                                                                                       \
+  do {                                                                                                                                 \
+    static_assert(FEX::HLE::x64::SYSCALL_x64_##name >= 0 && FEX::HLE::x64::SYSCALL_x64_##name < FEX::HLE::x64::SYSCALL_x64_MAX);       \
+    static_assert(FEX::HLE::Arm64::SYSCALL_Arm64_##name >= 0 && FEX::HLE::Arm64::SYSCALL_Arm64_##name < FEX::HLE::Arm64::SYSCALL_Arm64_MAX); \
+    FEX::HLE::x64::RegisterSyscall(Handler, FEX::HLE::x64::SYSCALL_x64_##name, #name, SyscallPassthrough##nargs<SYSCALL_DEF(name)>,    \
+                                   DirectPassthroughNumber(FEX::HLE::x64::SYSCALL_x64_##name, FEX::HLE::Arm64::SYSCALL_Arm64_##name)); \
+    FEX::HLE::x32::RegisterSyscall(Handler, FEX::HLE::x32::SYSCALL_x86_##name, #name, SyscallPassthrough##nargs<SYSCALL_DEF(name)>);   \
+  } while (false)
+
+#define REGISTER_PASSTHROUGH_X64(name, nargs)                                                                                          \
+  do {                                                                                                                                 \
+    static_assert(x64::SYSCALL_x64_##name >= 0 && x64::SYSCALL_x64_##name < x64::SYSCALL_x64_MAX);                                     \
+    static_assert(FEX::HLE::Arm64::SYSCALL_Arm64_##name >= 0 && FEX::HLE::Arm64::SYSCALL_Arm64_##name < FEX::HLE::Arm64::SYSCALL_Arm64_MAX); \
+    FEX::HLE::x64::RegisterSyscall(Handler, x64::SYSCALL_x64_##name, #name, SyscallPassthrough##nargs<SYSCALL_DEF(name)>,              \
+                                   DirectPassthroughNumber(x64::SYSCALL_x64_##name, FEX::HLE::Arm64::SYSCALL_Arm64_##name));           \
+  } while (false)
+
 static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
-  REGISTER_SYSCALL_IMPL(read, SyscallPassthrough3<SYSCALL_DEF(read)>);
-  REGISTER_SYSCALL_IMPL(write, SyscallPassthrough3<SYSCALL_DEF(write)>);
-  REGISTER_SYSCALL_IMPL(lseek, SyscallPassthrough3<SYSCALL_DEF(lseek)>);
-  REGISTER_SYSCALL_IMPL(sched_yield, SyscallPassthrough0<SYSCALL_DEF(sched_yield)>);
-  REGISTER_SYSCALL_IMPL(msync, SyscallPassthrough3<SYSCALL_DEF(msync)>);
-  REGISTER_SYSCALL_IMPL(mincore, SyscallPassthrough3<SYSCALL_DEF(mincore)>);
-  REGISTER_SYSCALL_IMPL(shmget, SyscallPassthrough3<SYSCALL_DEF(shmget)>);
-  REGISTER_SYSCALL_IMPL(shmctl, SyscallPassthrough3<SYSCALL_DEF(shmctl)>);
-  REGISTER_SYSCALL_IMPL(getpid, SyscallPassthrough0<SYSCALL_DEF(getpid)>);
-  REGISTER_SYSCALL_IMPL(socket, SyscallPassthrough3<SYSCALL_DEF(socket)>);
-  REGISTER_SYSCALL_IMPL(connect, SyscallPassthrough3<SYSCALL_DEF(connect)>);
-  REGISTER_SYSCALL_IMPL(sendto, SyscallPassthrough6<SYSCALL_DEF(sendto)>);
-  REGISTER_SYSCALL_IMPL(recvfrom, SyscallPassthrough6<SYSCALL_DEF(recvfrom)>);
-  REGISTER_SYSCALL_IMPL(shutdown, SyscallPassthrough2<SYSCALL_DEF(shutdown)>);
-  REGISTER_SYSCALL_IMPL(bind, SyscallPassthrough3<SYSCALL_DEF(bind)>);
-  REGISTER_SYSCALL_IMPL(listen, SyscallPassthrough2<SYSCALL_DEF(listen)>);
-  REGISTER_SYSCALL_IMPL(getsockname, SyscallPassthrough3<SYSCALL_DEF(getsockname)>);
-  REGISTER_SYSCALL_IMPL(getpeername, SyscallPassthrough3<SYSCALL_DEF(getpeername)>);
-  REGISTER_SYSCALL_IMPL(socketpair, SyscallPassthrough4<SYSCALL_DEF(socketpair)>);
+  REGISTER_PASSTHROUGH_COMMON(read, 3);
+  REGISTER_PASSTHROUGH_COMMON(write, 3);
+  REGISTER_PASSTHROUGH_COMMON(lseek, 3);
+  REGISTER_PASSTHROUGH_COMMON(sched_yield, 0);
+  REGISTER_PASSTHROUGH_COMMON(msync, 3);
+  REGISTER_PASSTHROUGH_COMMON(mincore, 3);
+  REGISTER_PASSTHROUGH_COMMON(shmget, 3);
+  REGISTER_PASSTHROUGH_COMMON(shmctl, 3);
+  REGISTER_PASSTHROUGH_COMMON(getpid, 0);
+  REGISTER_PASSTHROUGH_COMMON(socket, 3);
+  REGISTER_PASSTHROUGH_COMMON(connect, 3);
+  REGISTER_PASSTHROUGH_COMMON(sendto, 6);
+  REGISTER_PASSTHROUGH_COMMON(recvfrom, 6);
+  REGISTER_PASSTHROUGH_COMMON(shutdown, 2);
+  REGISTER_PASSTHROUGH_COMMON(bind, 3);
+  REGISTER_PASSTHROUGH_COMMON(listen, 2);
+  REGISTER_PASSTHROUGH_COMMON(getsockname, 3);
+  REGISTER_PASSTHROUGH_COMMON(getpeername, 3);
+  REGISTER_PASSTHROUGH_COMMON(socketpair, 4);
+  // Conservatively keep signal-sending syscall on the C++ slow path.
   REGISTER_SYSCALL_IMPL(kill, SyscallPassthrough2<SYSCALL_DEF(kill)>);
-  REGISTER_SYSCALL_IMPL(semget, SyscallPassthrough3<SYSCALL_DEF(semget)>);
-  REGISTER_SYSCALL_IMPL(msgget, SyscallPassthrough2<SYSCALL_DEF(msgget)>);
-  REGISTER_SYSCALL_IMPL(msgsnd, SyscallPassthrough4<SYSCALL_DEF(msgsnd)>);
-  REGISTER_SYSCALL_IMPL(msgrcv, SyscallPassthrough5<SYSCALL_DEF(msgrcv)>);
-  REGISTER_SYSCALL_IMPL(msgctl, SyscallPassthrough3<SYSCALL_DEF(msgctl)>);
-  REGISTER_SYSCALL_IMPL(flock, SyscallPassthrough2<SYSCALL_DEF(flock)>);
-  REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
-  REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
-  REGISTER_SYSCALL_IMPL(truncate, SyscallPassthrough2<SYSCALL_DEF(truncate)>);
-  REGISTER_SYSCALL_IMPL(getcwd, SyscallPassthrough2<SYSCALL_DEF(getcwd)>);
-  REGISTER_SYSCALL_IMPL(chdir, SyscallPassthrough1<SYSCALL_DEF(chdir)>);
-  REGISTER_SYSCALL_IMPL(fchdir, SyscallPassthrough1<SYSCALL_DEF(fchdir)>);
-  REGISTER_SYSCALL_IMPL(fchmod, SyscallPassthrough2<SYSCALL_DEF(fchmod)>);
-  REGISTER_SYSCALL_IMPL(fchown, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
-  REGISTER_SYSCALL_IMPL(umask, SyscallPassthrough1<SYSCALL_DEF(umask)>);
-  REGISTER_SYSCALL_IMPL(getuid, SyscallPassthrough0<SYSCALL_DEF(getuid)>);
-  REGISTER_SYSCALL_IMPL(syslog, SyscallPassthrough3<SYSCALL_DEF(syslog)>);
-  REGISTER_SYSCALL_IMPL(getgid, SyscallPassthrough0<SYSCALL_DEF(getgid)>);
-  REGISTER_SYSCALL_IMPL(setuid, SyscallPassthrough1<SYSCALL_DEF(setuid)>);
-  REGISTER_SYSCALL_IMPL(setgid, SyscallPassthrough1<SYSCALL_DEF(setgid)>);
-  REGISTER_SYSCALL_IMPL(geteuid, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
-  REGISTER_SYSCALL_IMPL(getegid, SyscallPassthrough0<SYSCALL_DEF(getegid)>);
+  REGISTER_PASSTHROUGH_COMMON(semget, 3);
+  REGISTER_PASSTHROUGH_COMMON(msgget, 2);
+  REGISTER_PASSTHROUGH_COMMON(msgsnd, 4);
+  REGISTER_PASSTHROUGH_COMMON(msgrcv, 5);
+  REGISTER_PASSTHROUGH_COMMON(msgctl, 3);
+  REGISTER_PASSTHROUGH_COMMON(flock, 2);
+  REGISTER_PASSTHROUGH_COMMON(fsync, 1);
+  REGISTER_PASSTHROUGH_COMMON(fdatasync, 1);
+  REGISTER_PASSTHROUGH_COMMON(truncate, 2);
+  REGISTER_PASSTHROUGH_COMMON(getcwd, 2);
+  REGISTER_PASSTHROUGH_COMMON(chdir, 1);
+  REGISTER_PASSTHROUGH_COMMON(fchdir, 1);
+  REGISTER_PASSTHROUGH_COMMON(fchmod, 2);
+  REGISTER_PASSTHROUGH_COMMON(fchown, 3);
+  REGISTER_PASSTHROUGH_COMMON(umask, 1);
+  REGISTER_PASSTHROUGH_COMMON(getuid, 0);
+  REGISTER_PASSTHROUGH_COMMON(syslog, 3);
+  REGISTER_PASSTHROUGH_COMMON(getgid, 0);
+  REGISTER_PASSTHROUGH_COMMON(setuid, 1);
+  REGISTER_PASSTHROUGH_COMMON(setgid, 1);
+  REGISTER_PASSTHROUGH_COMMON(geteuid, 0);
+  REGISTER_PASSTHROUGH_COMMON(getegid, 0);
   // posix_spawn(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP) does setsid()
   // then setpgid(0, 0). The kernel returns EPERM because the process is
   // already a session leader, even when the requested group is already in
@@ -343,140 +379,142 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
     }
     SYSCALL_ERRNO();
   });
-  REGISTER_SYSCALL_IMPL(getppid, SyscallPassthrough0<SYSCALL_DEF(getppid)>);
-  REGISTER_SYSCALL_IMPL(setsid, SyscallPassthrough0<SYSCALL_DEF(setsid)>);
-  REGISTER_SYSCALL_IMPL(setreuid, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
-  REGISTER_SYSCALL_IMPL(setregid, SyscallPassthrough2<SYSCALL_DEF(setregid)>);
-  REGISTER_SYSCALL_IMPL(getgroups, SyscallPassthrough2<SYSCALL_DEF(getgroups)>);
-  REGISTER_SYSCALL_IMPL(setgroups, SyscallPassthrough2<SYSCALL_DEF(setgroups)>);
-  REGISTER_SYSCALL_IMPL(setresuid, SyscallPassthrough3<SYSCALL_DEF(setresuid)>);
-  REGISTER_SYSCALL_IMPL(getresuid, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
-  REGISTER_SYSCALL_IMPL(setresgid, SyscallPassthrough3<SYSCALL_DEF(setresgid)>);
-  REGISTER_SYSCALL_IMPL(getresgid, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
-  REGISTER_SYSCALL_IMPL(getpgid, SyscallPassthrough1<SYSCALL_DEF(getpgid)>);
-  REGISTER_SYSCALL_IMPL(setfsuid, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
-  REGISTER_SYSCALL_IMPL(setfsgid, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
-  REGISTER_SYSCALL_IMPL(getsid, SyscallPassthrough1<SYSCALL_DEF(getsid)>);
-  REGISTER_SYSCALL_IMPL(capget, SyscallPassthrough2<SYSCALL_DEF(capget)>);
-  REGISTER_SYSCALL_IMPL(capset, SyscallPassthrough2<SYSCALL_DEF(capset)>);
-  REGISTER_SYSCALL_IMPL(getpriority, SyscallPassthrough2<SYSCALL_DEF(getpriority)>);
-  REGISTER_SYSCALL_IMPL(setpriority, SyscallPassthrough3<SYSCALL_DEF(setpriority)>);
-  REGISTER_SYSCALL_IMPL(sched_setparam, SyscallPassthrough2<SYSCALL_DEF(sched_setparam)>);
-  REGISTER_SYSCALL_IMPL(sched_getparam, SyscallPassthrough2<SYSCALL_DEF(sched_getparam)>);
-  REGISTER_SYSCALL_IMPL(sched_setscheduler, SyscallPassthrough3<SYSCALL_DEF(sched_setscheduler)>);
-  REGISTER_SYSCALL_IMPL(sched_getscheduler, SyscallPassthrough1<SYSCALL_DEF(sched_getscheduler)>);
-  REGISTER_SYSCALL_IMPL(sched_get_priority_max, SyscallPassthrough1<SYSCALL_DEF(sched_get_priority_max)>);
-  REGISTER_SYSCALL_IMPL(sched_get_priority_min, SyscallPassthrough1<SYSCALL_DEF(sched_get_priority_min)>);
-  REGISTER_SYSCALL_IMPL(mlock, SyscallPassthrough2<SYSCALL_DEF(mlock)>);
-  REGISTER_SYSCALL_IMPL(munlock, SyscallPassthrough2<SYSCALL_DEF(munlock)>);
-  REGISTER_SYSCALL_IMPL(pivot_root, SyscallPassthrough2<SYSCALL_DEF(pivot_root)>);
-  REGISTER_SYSCALL_IMPL(chroot, SyscallPassthrough1<SYSCALL_DEF(chroot)>);
-  REGISTER_SYSCALL_IMPL(sync, SyscallPassthrough0<SYSCALL_DEF(sync)>);
-  REGISTER_SYSCALL_IMPL(acct, SyscallPassthrough1<SYSCALL_DEF(acct)>);
-  REGISTER_SYSCALL_IMPL(mount, SyscallPassthrough5<SYSCALL_DEF(mount)>);
-  REGISTER_SYSCALL_IMPL(umount2, SyscallPassthrough2<SYSCALL_DEF(umount2)>);
-  REGISTER_SYSCALL_IMPL(swapon, SyscallPassthrough2<SYSCALL_DEF(swapon)>);
-  REGISTER_SYSCALL_IMPL(swapoff, SyscallPassthrough1<SYSCALL_DEF(swapoff)>);
-  REGISTER_SYSCALL_IMPL(gettid, SyscallPassthrough0<SYSCALL_DEF(gettid)>);
-  REGISTER_SYSCALL_IMPL(fsetxattr, SyscallPassthrough5<SYSCALL_DEF(fsetxattr)>);
-  REGISTER_SYSCALL_IMPL(fgetxattr, SyscallPassthrough4<SYSCALL_DEF(fgetxattr)>);
-  REGISTER_SYSCALL_IMPL(flistxattr, SyscallPassthrough3<SYSCALL_DEF(flistxattr)>);
-  REGISTER_SYSCALL_IMPL(fremovexattr, SyscallPassthrough2<SYSCALL_DEF(fremovexattr)>);
+  REGISTER_PASSTHROUGH_COMMON(getppid, 0);
+  REGISTER_PASSTHROUGH_COMMON(setsid, 0);
+  REGISTER_PASSTHROUGH_COMMON(setreuid, 2);
+  REGISTER_PASSTHROUGH_COMMON(setregid, 2);
+  REGISTER_PASSTHROUGH_COMMON(getgroups, 2);
+  REGISTER_PASSTHROUGH_COMMON(setgroups, 2);
+  REGISTER_PASSTHROUGH_COMMON(setresuid, 3);
+  REGISTER_PASSTHROUGH_COMMON(getresuid, 3);
+  REGISTER_PASSTHROUGH_COMMON(setresgid, 3);
+  REGISTER_PASSTHROUGH_COMMON(getresgid, 3);
+  REGISTER_PASSTHROUGH_COMMON(getpgid, 1);
+  REGISTER_PASSTHROUGH_COMMON(setfsuid, 1);
+  REGISTER_PASSTHROUGH_COMMON(setfsgid, 1);
+  REGISTER_PASSTHROUGH_COMMON(getsid, 1);
+  REGISTER_PASSTHROUGH_COMMON(capget, 2);
+  REGISTER_PASSTHROUGH_COMMON(capset, 2);
+  REGISTER_PASSTHROUGH_COMMON(getpriority, 2);
+  REGISTER_PASSTHROUGH_COMMON(setpriority, 3);
+  REGISTER_PASSTHROUGH_COMMON(sched_setparam, 2);
+  REGISTER_PASSTHROUGH_COMMON(sched_getparam, 2);
+  REGISTER_PASSTHROUGH_COMMON(sched_setscheduler, 3);
+  REGISTER_PASSTHROUGH_COMMON(sched_getscheduler, 1);
+  REGISTER_PASSTHROUGH_COMMON(sched_get_priority_max, 1);
+  REGISTER_PASSTHROUGH_COMMON(sched_get_priority_min, 1);
+  REGISTER_PASSTHROUGH_COMMON(mlock, 2);
+  REGISTER_PASSTHROUGH_COMMON(munlock, 2);
+  REGISTER_PASSTHROUGH_COMMON(pivot_root, 2);
+  REGISTER_PASSTHROUGH_COMMON(chroot, 1);
+  REGISTER_PASSTHROUGH_COMMON(sync, 0);
+  REGISTER_PASSTHROUGH_COMMON(acct, 1);
+  REGISTER_PASSTHROUGH_COMMON(mount, 5);
+  REGISTER_PASSTHROUGH_COMMON(umount2, 2);
+  REGISTER_PASSTHROUGH_COMMON(swapon, 2);
+  REGISTER_PASSTHROUGH_COMMON(swapoff, 1);
+  REGISTER_PASSTHROUGH_COMMON(gettid, 0);
+  REGISTER_PASSTHROUGH_COMMON(fsetxattr, 5);
+  REGISTER_PASSTHROUGH_COMMON(fgetxattr, 4);
+  REGISTER_PASSTHROUGH_COMMON(flistxattr, 3);
+  REGISTER_PASSTHROUGH_COMMON(fremovexattr, 2);
+  // Conservatively keep signal-sending syscall on the C++ slow path.
   REGISTER_SYSCALL_IMPL(tkill, SyscallPassthrough2<SYSCALL_DEF(tkill)>);
-  REGISTER_SYSCALL_IMPL(sched_setaffinity, SyscallPassthrough3<SYSCALL_DEF(sched_setaffinity)>);
-  REGISTER_SYSCALL_IMPL(sched_getaffinity, SyscallPassthrough3<SYSCALL_DEF(sched_getaffinity)>);
-  REGISTER_SYSCALL_IMPL(io_setup, SyscallPassthrough2<SYSCALL_DEF(io_setup)>);
-  REGISTER_SYSCALL_IMPL(io_destroy, SyscallPassthrough1<SYSCALL_DEF(io_destroy)>);
-  REGISTER_SYSCALL_IMPL(io_submit, SyscallPassthrough3<SYSCALL_DEF(io_submit)>);
-  REGISTER_SYSCALL_IMPL(io_cancel, SyscallPassthrough3<SYSCALL_DEF(io_cancel)>);
-  REGISTER_SYSCALL_IMPL(remap_file_pages, SyscallPassthrough5<SYSCALL_DEF(remap_file_pages)>);
-  REGISTER_SYSCALL_IMPL(timer_getoverrun, SyscallPassthrough1<SYSCALL_DEF(timer_getoverrun)>);
-  REGISTER_SYSCALL_IMPL(timer_delete, SyscallPassthrough1<SYSCALL_DEF(timer_delete)>);
+  REGISTER_PASSTHROUGH_COMMON(sched_setaffinity, 3);
+  REGISTER_PASSTHROUGH_COMMON(sched_getaffinity, 3);
+  REGISTER_PASSTHROUGH_COMMON(io_setup, 2);
+  REGISTER_PASSTHROUGH_COMMON(io_destroy, 1);
+  REGISTER_PASSTHROUGH_COMMON(io_submit, 3);
+  REGISTER_PASSTHROUGH_COMMON(io_cancel, 3);
+  REGISTER_PASSTHROUGH_COMMON(remap_file_pages, 5);
+  REGISTER_PASSTHROUGH_COMMON(timer_getoverrun, 1);
+  REGISTER_PASSTHROUGH_COMMON(timer_delete, 1);
+  // Conservatively keep signal-sending syscall on the C++ slow path.
   REGISTER_SYSCALL_IMPL(tgkill, SyscallPassthrough3<SYSCALL_DEF(tgkill)>);
-  REGISTER_SYSCALL_IMPL(mbind, SyscallPassthrough6<SYSCALL_DEF(mbind)>);
-  REGISTER_SYSCALL_IMPL(set_mempolicy, SyscallPassthrough3<SYSCALL_DEF(set_mempolicy)>);
-  REGISTER_SYSCALL_IMPL(get_mempolicy, SyscallPassthrough5<SYSCALL_DEF(get_mempolicy)>);
-  REGISTER_SYSCALL_IMPL(mq_unlink, SyscallPassthrough1<SYSCALL_DEF(mq_unlink)>);
-  REGISTER_SYSCALL_IMPL(add_key, SyscallPassthrough5<SYSCALL_DEF(add_key)>);
-  REGISTER_SYSCALL_IMPL(request_key, SyscallPassthrough4<SYSCALL_DEF(request_key)>);
-  REGISTER_SYSCALL_IMPL(keyctl, SyscallPassthrough5<SYSCALL_DEF(keyctl)>);
-  REGISTER_SYSCALL_IMPL(ioprio_set, SyscallPassthrough2<SYSCALL_DEF(ioprio_set)>);
-  REGISTER_SYSCALL_IMPL(ioprio_get, SyscallPassthrough3<SYSCALL_DEF(ioprio_get)>);
-  REGISTER_SYSCALL_IMPL(inotify_add_watch, SyscallPassthrough3<SYSCALL_DEF(inotify_add_watch)>);
-  REGISTER_SYSCALL_IMPL(inotify_rm_watch, SyscallPassthrough2<SYSCALL_DEF(inotify_rm_watch)>);
-  REGISTER_SYSCALL_IMPL(migrate_pages, SyscallPassthrough4<SYSCALL_DEF(migrate_pages)>);
-  REGISTER_SYSCALL_IMPL(mkdirat, SyscallPassthrough3<SYSCALL_DEF(mkdirat)>);
-  REGISTER_SYSCALL_IMPL(mknodat, SyscallPassthrough4<SYSCALL_DEF(mknodat)>);
-  REGISTER_SYSCALL_IMPL(fchownat, SyscallPassthrough5<SYSCALL_DEF(fchownat)>);
-  REGISTER_SYSCALL_IMPL(unlinkat, SyscallPassthrough3<SYSCALL_DEF(unlinkat)>);
-  REGISTER_SYSCALL_IMPL(renameat, SyscallPassthrough4<SYSCALL_DEF(renameat)>);
-  REGISTER_SYSCALL_IMPL(linkat, SyscallPassthrough5<SYSCALL_DEF(linkat)>);
-  REGISTER_SYSCALL_IMPL(symlinkat, SyscallPassthrough3<SYSCALL_DEF(symlinkat)>);
-  REGISTER_SYSCALL_IMPL(fchmodat, SyscallPassthrough3<SYSCALL_DEF(fchmodat)>);
-  REGISTER_SYSCALL_IMPL(unshare, SyscallPassthrough1<SYSCALL_DEF(unshare)>);
-  REGISTER_SYSCALL_IMPL(splice, SyscallPassthrough6<SYSCALL_DEF(splice)>);
-  REGISTER_SYSCALL_IMPL(tee, SyscallPassthrough4<SYSCALL_DEF(tee)>);
-  REGISTER_SYSCALL_IMPL(move_pages, SyscallPassthrough6<SYSCALL_DEF(move_pages)>);
-  REGISTER_SYSCALL_IMPL(timerfd_create, SyscallPassthrough2<SYSCALL_DEF(timerfd_create)>);
-  REGISTER_SYSCALL_IMPL(accept4, SyscallPassthrough4<SYSCALL_DEF(accept4)>);
-  REGISTER_SYSCALL_IMPL(eventfd2, SyscallPassthrough2<SYSCALL_DEF(eventfd2)>);
-  REGISTER_SYSCALL_IMPL(epoll_create1, SyscallPassthrough1<SYSCALL_DEF(epoll_create1)>);
-  REGISTER_SYSCALL_IMPL(inotify_init1, SyscallPassthrough1<SYSCALL_DEF(inotify_init1)>);
-  REGISTER_SYSCALL_IMPL(fanotify_init, SyscallPassthrough2<SYSCALL_DEF(fanotify_init)>);
-  REGISTER_SYSCALL_IMPL(fanotify_mark, SyscallPassthrough5<SYSCALL_DEF(fanotify_mark)>);
-  REGISTER_SYSCALL_IMPL(prlimit_64, SyscallPassthrough4<SYSCALL_DEF(prlimit_64)>);
-  REGISTER_SYSCALL_IMPL(name_to_handle_at, SyscallPassthrough5<SYSCALL_DEF(name_to_handle_at)>);
-  REGISTER_SYSCALL_IMPL(open_by_handle_at, SyscallPassthrough3<SYSCALL_DEF(open_by_handle_at)>);
-  REGISTER_SYSCALL_IMPL(syncfs, SyscallPassthrough1<SYSCALL_DEF(syncfs)>);
-  REGISTER_SYSCALL_IMPL(setns, SyscallPassthrough2<SYSCALL_DEF(setns)>);
-  REGISTER_SYSCALL_IMPL(getcpu, SyscallPassthrough3<SYSCALL_DEF(getcpu)>);
-  REGISTER_SYSCALL_IMPL(kcmp, SyscallPassthrough5<SYSCALL_DEF(kcmp)>);
-  REGISTER_SYSCALL_IMPL(sched_setattr, SyscallPassthrough3<SYSCALL_DEF(sched_setattr)>);
-  REGISTER_SYSCALL_IMPL(sched_getattr, SyscallPassthrough4<SYSCALL_DEF(sched_getattr)>);
-  REGISTER_SYSCALL_IMPL(renameat2, SyscallPassthrough5<SYSCALL_DEF(renameat2)>);
-  REGISTER_SYSCALL_IMPL(getrandom, SyscallPassthrough3<SYSCALL_DEF(getrandom)>);
-  REGISTER_SYSCALL_IMPL(memfd_create, SyscallPassthrough2<SYSCALL_DEF(memfd_create)>);
-  REGISTER_SYSCALL_IMPL(membarrier, SyscallPassthrough2<SYSCALL_DEF(membarrier)>);
-  REGISTER_SYSCALL_IMPL(mlock2, SyscallPassthrough3<SYSCALL_DEF(mlock2)>);
-  REGISTER_SYSCALL_IMPL(copy_file_range, SyscallPassthrough6<SYSCALL_DEF(copy_file_range)>);
-  REGISTER_SYSCALL_IMPL(pkey_mprotect, SyscallPassthrough4<SYSCALL_DEF(pkey_mprotect)>);
-  REGISTER_SYSCALL_IMPL(pkey_alloc, SyscallPassthrough2<SYSCALL_DEF(pkey_alloc)>);
-  REGISTER_SYSCALL_IMPL(pkey_free, SyscallPassthrough1<SYSCALL_DEF(pkey_free)>);
-  REGISTER_SYSCALL_IMPL(open_tree, SyscallPassthrough3<SYSCALL_DEF(open_tree)>);
-  REGISTER_SYSCALL_IMPL(move_mount, SyscallPassthrough5<SYSCALL_DEF(move_mount)>);
-  REGISTER_SYSCALL_IMPL(fsopen, SyscallPassthrough3<SYSCALL_DEF(fsopen)>);
-  REGISTER_SYSCALL_IMPL(fsconfig, SyscallPassthrough5<SYSCALL_DEF(fsconfig)>);
-  REGISTER_SYSCALL_IMPL(fsmount, SyscallPassthrough3<SYSCALL_DEF(fsmount)>);
-  REGISTER_SYSCALL_IMPL(fspick, SyscallPassthrough3<SYSCALL_DEF(fspick)>);
-  REGISTER_SYSCALL_IMPL(pidfd_open, SyscallPassthrough2<SYSCALL_DEF(pidfd_open)>);
-  REGISTER_SYSCALL_IMPL(pidfd_getfd, SyscallPassthrough3<SYSCALL_DEF(pidfd_getfd)>);
-  REGISTER_SYSCALL_IMPL(mount_setattr, SyscallPassthrough5<SYSCALL_DEF(mount_setattr)>);
-  REGISTER_SYSCALL_IMPL(quotactl_fd, SyscallPassthrough4<SYSCALL_DEF(quotactl_fd)>);
-  REGISTER_SYSCALL_IMPL(landlock_create_ruleset, SyscallPassthrough3<SYSCALL_DEF(landlock_create_ruleset)>);
-  REGISTER_SYSCALL_IMPL(landlock_add_rule, SyscallPassthrough4<SYSCALL_DEF(landlock_add_rule)>);
-  REGISTER_SYSCALL_IMPL(landlock_restrict_self, SyscallPassthrough2<SYSCALL_DEF(landlock_restrict_self)>);
-  REGISTER_SYSCALL_IMPL(memfd_secret, SyscallPassthrough1<SYSCALL_DEF(memfd_secret)>);
-  REGISTER_SYSCALL_IMPL(process_mrelease, SyscallPassthrough2<SYSCALL_DEF(process_mrelease)>);
+  REGISTER_PASSTHROUGH_COMMON(mbind, 6);
+  REGISTER_PASSTHROUGH_COMMON(set_mempolicy, 3);
+  REGISTER_PASSTHROUGH_COMMON(get_mempolicy, 5);
+  REGISTER_PASSTHROUGH_COMMON(mq_unlink, 1);
+  REGISTER_PASSTHROUGH_COMMON(add_key, 5);
+  REGISTER_PASSTHROUGH_COMMON(request_key, 4);
+  REGISTER_PASSTHROUGH_COMMON(keyctl, 5);
+  REGISTER_PASSTHROUGH_COMMON(ioprio_set, 2);
+  REGISTER_PASSTHROUGH_COMMON(ioprio_get, 3);
+  REGISTER_PASSTHROUGH_COMMON(inotify_add_watch, 3);
+  REGISTER_PASSTHROUGH_COMMON(inotify_rm_watch, 2);
+  REGISTER_PASSTHROUGH_COMMON(migrate_pages, 4);
+  REGISTER_PASSTHROUGH_COMMON(mkdirat, 3);
+  REGISTER_PASSTHROUGH_COMMON(mknodat, 4);
+  REGISTER_PASSTHROUGH_COMMON(fchownat, 5);
+  REGISTER_PASSTHROUGH_COMMON(unlinkat, 3);
+  REGISTER_PASSTHROUGH_COMMON(renameat, 4);
+  REGISTER_PASSTHROUGH_COMMON(linkat, 5);
+  REGISTER_PASSTHROUGH_COMMON(symlinkat, 3);
+  REGISTER_PASSTHROUGH_COMMON(fchmodat, 3);
+  REGISTER_PASSTHROUGH_COMMON(unshare, 1);
+  REGISTER_PASSTHROUGH_COMMON(splice, 6);
+  REGISTER_PASSTHROUGH_COMMON(tee, 4);
+  REGISTER_PASSTHROUGH_COMMON(move_pages, 6);
+  REGISTER_PASSTHROUGH_COMMON(timerfd_create, 2);
+  REGISTER_PASSTHROUGH_COMMON(accept4, 4);
+  REGISTER_PASSTHROUGH_COMMON(eventfd2, 2);
+  REGISTER_PASSTHROUGH_COMMON(epoll_create1, 1);
+  REGISTER_PASSTHROUGH_COMMON(inotify_init1, 1);
+  REGISTER_PASSTHROUGH_COMMON(fanotify_init, 2);
+  REGISTER_PASSTHROUGH_COMMON(fanotify_mark, 5);
+  REGISTER_PASSTHROUGH_COMMON(prlimit_64, 4);
+  REGISTER_PASSTHROUGH_COMMON(name_to_handle_at, 5);
+  REGISTER_PASSTHROUGH_COMMON(open_by_handle_at, 3);
+  REGISTER_PASSTHROUGH_COMMON(syncfs, 1);
+  REGISTER_PASSTHROUGH_COMMON(setns, 2);
+  REGISTER_PASSTHROUGH_COMMON(getcpu, 3);
+  REGISTER_PASSTHROUGH_COMMON(kcmp, 5);
+  REGISTER_PASSTHROUGH_COMMON(sched_setattr, 3);
+  REGISTER_PASSTHROUGH_COMMON(sched_getattr, 4);
+  REGISTER_PASSTHROUGH_COMMON(renameat2, 5);
+  REGISTER_PASSTHROUGH_COMMON(getrandom, 3);
+  REGISTER_PASSTHROUGH_COMMON(memfd_create, 2);
+  REGISTER_PASSTHROUGH_COMMON(membarrier, 2);
+  REGISTER_PASSTHROUGH_COMMON(mlock2, 3);
+  REGISTER_PASSTHROUGH_COMMON(copy_file_range, 6);
+  REGISTER_PASSTHROUGH_COMMON(pkey_mprotect, 4);
+  REGISTER_PASSTHROUGH_COMMON(pkey_alloc, 2);
+  REGISTER_PASSTHROUGH_COMMON(pkey_free, 1);
+  REGISTER_PASSTHROUGH_COMMON(open_tree, 3);
+  REGISTER_PASSTHROUGH_COMMON(move_mount, 5);
+  REGISTER_PASSTHROUGH_COMMON(fsopen, 3);
+  REGISTER_PASSTHROUGH_COMMON(fsconfig, 5);
+  REGISTER_PASSTHROUGH_COMMON(fsmount, 3);
+  REGISTER_PASSTHROUGH_COMMON(fspick, 3);
+  REGISTER_PASSTHROUGH_COMMON(pidfd_open, 2);
+  REGISTER_PASSTHROUGH_COMMON(pidfd_getfd, 3);
+  REGISTER_PASSTHROUGH_COMMON(mount_setattr, 5);
+  REGISTER_PASSTHROUGH_COMMON(quotactl_fd, 4);
+  REGISTER_PASSTHROUGH_COMMON(landlock_create_ruleset, 3);
+  REGISTER_PASSTHROUGH_COMMON(landlock_add_rule, 4);
+  REGISTER_PASSTHROUGH_COMMON(landlock_restrict_self, 2);
+  REGISTER_PASSTHROUGH_COMMON(memfd_secret, 1);
+  REGISTER_PASSTHROUGH_COMMON(process_mrelease, 2);
   if (Handler->IsHostKernelVersionAtLeast(5, 16, 0)) {
-    REGISTER_SYSCALL_IMPL(futex_waitv, SyscallPassthrough5<SYSCALL_DEF(futex_waitv)>);
+    REGISTER_PASSTHROUGH_COMMON(futex_waitv, 5);
   } else {
     REGISTER_SYSCALL_IMPL(futex_waitv, UnimplementedSyscallSafe);
   }
   if (Handler->IsHostKernelVersionAtLeast(5, 17, 0)) {
-    REGISTER_SYSCALL_IMPL(set_mempolicy_home_node, SyscallPassthrough4<SYSCALL_DEF(set_mempolicy_home_node)>);
+    REGISTER_PASSTHROUGH_COMMON(set_mempolicy_home_node, 4);
   } else {
     REGISTER_SYSCALL_IMPL(set_mempolicy_home_node, UnimplementedSyscallSafe);
   }
 
   if (Handler->IsHostKernelVersionAtLeast(6, 8, 0)) {
-    REGISTER_SYSCALL_IMPL(futex_wake, SyscallPassthrough4<SYSCALL_DEF(futex_wake)>);
-    REGISTER_SYSCALL_IMPL(futex_wait, SyscallPassthrough6<SYSCALL_DEF(futex_wait)>);
-    REGISTER_SYSCALL_IMPL(futex_requeue, SyscallPassthrough4<SYSCALL_DEF(futex_requeue)>);
-    REGISTER_SYSCALL_IMPL(statmount, SyscallPassthrough4<SYSCALL_DEF(statmount)>);
-    REGISTER_SYSCALL_IMPL(listmount, SyscallPassthrough4<SYSCALL_DEF(listmount)>);
-    REGISTER_SYSCALL_IMPL(lsm_get_self_attr, SyscallPassthrough4<SYSCALL_DEF(lsm_get_self_attr)>);
-    REGISTER_SYSCALL_IMPL(lsm_set_self_attr, SyscallPassthrough4<SYSCALL_DEF(lsm_set_self_attr)>);
-    REGISTER_SYSCALL_IMPL(lsm_list_modules, SyscallPassthrough3<SYSCALL_DEF(lsm_list_modules)>);
+    REGISTER_PASSTHROUGH_COMMON(futex_wake, 4);
+    REGISTER_PASSTHROUGH_COMMON(futex_wait, 6);
+    REGISTER_PASSTHROUGH_COMMON(futex_requeue, 4);
+    REGISTER_PASSTHROUGH_COMMON(statmount, 4);
+    REGISTER_PASSTHROUGH_COMMON(listmount, 4);
+    REGISTER_PASSTHROUGH_COMMON(lsm_get_self_attr, 4);
+    REGISTER_PASSTHROUGH_COMMON(lsm_set_self_attr, 4);
+    REGISTER_PASSTHROUGH_COMMON(lsm_list_modules, 3);
   } else {
     REGISTER_SYSCALL_IMPL(futex_wake, UnimplementedSyscallSafe);
     REGISTER_SYSCALL_IMPL(futex_wait, UnimplementedSyscallSafe);
@@ -488,7 +526,7 @@ static void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
     REGISTER_SYSCALL_IMPL(lsm_list_modules, UnimplementedSyscallSafe);
   }
   if (Handler->IsHostKernelVersionAtLeast(6, 10, 0)) {
-    REGISTER_SYSCALL_IMPL(mseal, SyscallPassthrough3<SYSCALL_DEF(mseal)>);
+    REGISTER_PASSTHROUGH_COMMON(mseal, 3);
   } else {
     REGISTER_SYSCALL_IMPL(mseal, UnimplementedSyscallSafe);
   }
@@ -502,98 +540,111 @@ namespace x64 {
       REGISTER_SYSCALL_IMPL_X64(io_uring_enter, UnimplementedSyscallSafe);
       REGISTER_SYSCALL_IMPL_X64(io_uring_register, UnimplementedSyscallSafe);
     } else {
+#ifdef ARCHITECTURE_arm64
       REGISTER_SYSCALL_IMPL_X64(io_uring_setup, IOUringSetupRestricted);
-      REGISTER_SYSCALL_IMPL_X64(io_uring_enter, SyscallPassthrough6<SYSCALL_DEF(io_uring_enter)>);
-      REGISTER_SYSCALL_IMPL_X64(io_uring_register, SyscallPassthrough4<SYSCALL_DEF(io_uring_register)>);
+#else
+      REGISTER_SYSCALL_IMPL_X64(io_uring_setup, SyscallPassthrough2<SYSCALL_DEF(io_uring_setup)>);
+#endif
+      REGISTER_PASSTHROUGH_X64(io_uring_enter, 6);
+      REGISTER_PASSTHROUGH_X64(io_uring_register, 4);
     }
-    REGISTER_SYSCALL_IMPL_X64(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
-    REGISTER_SYSCALL_IMPL_X64(ioctl, [](FEXCore::Core::CpuStateFrame* Frame, int fd, uint64_t request, uint64_t args) -> uint64_t {
-      if (_IOC_TYPE(request) == UFFDIO) [[unlikely]] {
-        return FEX::HLE::UserfaultfdIoctl(fd, request, args);
-      }
-      return SyscallPassthrough3<SYSCALL_DEF(ioctl)>(Frame, fd, request, args);
-    });
-    REGISTER_SYSCALL_IMPL_X64(pread_64, SyscallPassthrough4<SYSCALL_DEF(pread_64)>);
-    REGISTER_SYSCALL_IMPL_X64(pwrite_64, SyscallPassthrough4<SYSCALL_DEF(pwrite_64)>);
-    REGISTER_SYSCALL_IMPL_X64(readv, SyscallPassthrough3<SYSCALL_DEF(readv)>);
-    REGISTER_SYSCALL_IMPL_X64(writev, SyscallPassthrough3<SYSCALL_DEF(writev)>);
-    REGISTER_SYSCALL_IMPL_X64(dup, SyscallPassthrough1<SYSCALL_DEF(dup)>);
-    REGISTER_SYSCALL_IMPL_X64(nanosleep, SyscallPassthrough2<SYSCALL_DEF(nanosleep)>);
-    REGISTER_SYSCALL_IMPL_X64(getitimer, SyscallPassthrough2<SYSCALL_DEF(getitimer)>);
-    REGISTER_SYSCALL_IMPL_X64(setitimer, SyscallPassthrough3<SYSCALL_DEF(setitimer)>);
-    REGISTER_SYSCALL_IMPL_X64(sendfile, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
-    REGISTER_SYSCALL_IMPL_X64(accept, SyscallPassthrough3<SYSCALL_DEF(accept)>);
-    REGISTER_SYSCALL_IMPL_X64(sendmsg, SyscallPassthrough3<SYSCALL_DEF(sendmsg)>);
-    REGISTER_SYSCALL_IMPL_X64(recvmsg, SyscallPassthrough3<SYSCALL_DEF(recvmsg)>);
-    REGISTER_SYSCALL_IMPL_X64(setsockopt, SyscallPassthrough5<SYSCALL_DEF(setsockopt)>);
-    REGISTER_SYSCALL_IMPL_X64(getsockopt, SyscallPassthrough5<SYSCALL_DEF(getsockopt)>);
-    REGISTER_SYSCALL_IMPL_X64(wait4, SyscallPassthrough4<SYSCALL_DEF(wait4)>);
-    REGISTER_SYSCALL_IMPL_X64(semop, SyscallPassthrough3<SYSCALL_DEF(semop)>);
-    REGISTER_SYSCALL_IMPL_X64(getrlimit, SyscallPassthrough2<SYSCALL_DEF(getrlimit)>);
-    REGISTER_SYSCALL_IMPL_X64(getrusage, SyscallPassthrough2<SYSCALL_DEF(getrusage)>);
-    REGISTER_SYSCALL_IMPL_X64(sysinfo, SyscallPassthrough1<SYSCALL_DEF(sysinfo)>);
-    REGISTER_SYSCALL_IMPL_X64(times, SyscallPassthrough1<SYSCALL_DEF(times)>);
+    REGISTER_PASSTHROUGH_X64(ftruncate, 2);
+    FEX::HLE::x64::RegisterSyscall(
+      Handler, x64::SYSCALL_x64_ioctl, "ioctl",
+      [](FEXCore::Core::CpuStateFrame* Frame, int fd, uint64_t request, uint64_t args) -> uint64_t {
+        if (_IOC_TYPE(request) == UFFDIO) [[unlikely]] {
+          return FEX::HLE::UserfaultfdIoctl(fd, request, args);
+        }
+        return SyscallPassthrough3<SYSCALL_DEF(ioctl)>(Frame, fd, request, args);
+      },
+      FEXCore::HLE::SyscallHandler::DIRECT_PASSTHROUGH_IOCTL);
+    REGISTER_PASSTHROUGH_X64(pread_64, 4);
+    REGISTER_PASSTHROUGH_X64(pwrite_64, 4);
+    REGISTER_PASSTHROUGH_X64(readv, 3);
+    REGISTER_PASSTHROUGH_X64(writev, 3);
+    REGISTER_PASSTHROUGH_X64(dup, 1);
+    REGISTER_PASSTHROUGH_X64(nanosleep, 2);
+    REGISTER_PASSTHROUGH_X64(getitimer, 2);
+    REGISTER_PASSTHROUGH_X64(setitimer, 3);
+    REGISTER_PASSTHROUGH_X64(sendfile, 4);
+    REGISTER_PASSTHROUGH_X64(accept, 3);
+    REGISTER_PASSTHROUGH_X64(sendmsg, 3);
+    REGISTER_PASSTHROUGH_X64(recvmsg, 3);
+    REGISTER_PASSTHROUGH_X64(setsockopt, 5);
+    REGISTER_PASSTHROUGH_X64(getsockopt, 5);
+    REGISTER_PASSTHROUGH_X64(wait4, 4);
+    REGISTER_PASSTHROUGH_X64(semop, 3);
+    REGISTER_PASSTHROUGH_X64(getrlimit, 2);
+    REGISTER_PASSTHROUGH_X64(getrusage, 2);
+    REGISTER_PASSTHROUGH_X64(sysinfo, 1);
+    REGISTER_PASSTHROUGH_X64(times, 1);
+    // Conservatively keep signal-sending syscall on the C++ slow path.
     REGISTER_SYSCALL_IMPL_X64(rt_sigqueueinfo, SyscallPassthrough3<SYSCALL_DEF(rt_sigqueueinfo)>);
-    REGISTER_SYSCALL_IMPL_X64(fstatfs, SyscallPassthrough2<SYSCALL_DEF(fstatfs)>);
-    REGISTER_SYSCALL_IMPL_X64(sched_rr_get_interval, SyscallPassthrough2<SYSCALL_DEF(sched_rr_get_interval)>);
-    REGISTER_SYSCALL_IMPL_X64(mlockall, SyscallPassthrough1<SYSCALL_DEF(mlockall)>);
-    REGISTER_SYSCALL_IMPL_X64(munlockall, SyscallPassthrough0<SYSCALL_DEF(munlockall)>);
-    REGISTER_SYSCALL_IMPL_X64(adjtimex, SyscallPassthrough1<SYSCALL_DEF(adjtimex)>);
-    REGISTER_SYSCALL_IMPL_X64(setrlimit, SyscallPassthrough2<SYSCALL_DEF(setrlimit)>);
-    REGISTER_SYSCALL_IMPL_X64(settimeofday, SyscallPassthrough2<SYSCALL_DEF(settimeofday)>);
-    REGISTER_SYSCALL_IMPL_X64(readahead, SyscallPassthrough3<SYSCALL_DEF(readahead)>);
-    REGISTER_SYSCALL_IMPL_X64(futex, SyscallPassthrough6<SYSCALL_DEF(futex)>);
-    REGISTER_SYSCALL_IMPL_X64(io_getevents, SyscallPassthrough5<SYSCALL_DEF(io_getevents)>);
-    REGISTER_SYSCALL_IMPL_X64(semtimedop, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
-    REGISTER_SYSCALL_IMPL_X64(timer_create, SyscallPassthrough3<SYSCALL_DEF(timer_create)>);
-    REGISTER_SYSCALL_IMPL_X64(timer_settime, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
-    REGISTER_SYSCALL_IMPL_X64(timer_gettime, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_settime, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_gettime, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_getres, SyscallPassthrough2<SYSCALL_DEF(clock_getres)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_nanosleep, SyscallPassthrough4<SYSCALL_DEF(clock_nanosleep)>);
-    REGISTER_SYSCALL_IMPL_X64(mq_open, SyscallPassthrough4<SYSCALL_DEF(mq_open)>);
-    REGISTER_SYSCALL_IMPL_X64(mq_timedsend, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
-    REGISTER_SYSCALL_IMPL_X64(mq_timedreceive, SyscallPassthrough5<SYSCALL_DEF(mq_timedreceive)>);
-    REGISTER_SYSCALL_IMPL_X64(mq_notify, SyscallPassthrough2<SYSCALL_DEF(mq_notify)>);
-    REGISTER_SYSCALL_IMPL_X64(mq_getsetattr, SyscallPassthrough3<SYSCALL_DEF(mq_getsetattr)>);
-    REGISTER_SYSCALL_IMPL_X64(waitid, SyscallPassthrough5<SYSCALL_DEF(waitid)>);
-    REGISTER_SYSCALL_IMPL_X64(pselect6, SyscallPassthrough6<SYSCALL_DEF(pselect6)>);
-    REGISTER_SYSCALL_IMPL_X64(ppoll, SyscallPassthrough5<SYSCALL_DEF(ppoll)>);
-    REGISTER_SYSCALL_IMPL_X64(set_robust_list, SyscallPassthrough2<SYSCALL_DEF(set_robust_list)>);
-    REGISTER_SYSCALL_IMPL_X64(get_robust_list, SyscallPassthrough3<SYSCALL_DEF(get_robust_list)>);
-    REGISTER_SYSCALL_IMPL_X64(sync_file_range, SyscallPassthrough4<SYSCALL_DEF(sync_file_range)>);
-    REGISTER_SYSCALL_IMPL_X64(vmsplice, SyscallPassthrough4<SYSCALL_DEF(vmsplice)>);
-    REGISTER_SYSCALL_IMPL_X64(utimensat, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);
-    REGISTER_SYSCALL_IMPL_X64(fallocate, SyscallPassthrough4<SYSCALL_DEF(fallocate)>);
-    REGISTER_SYSCALL_IMPL_X64(timerfd_settime, SyscallPassthrough4<SYSCALL_DEF(timerfd_settime)>);
-    REGISTER_SYSCALL_IMPL_X64(timerfd_gettime, SyscallPassthrough2<SYSCALL_DEF(timerfd_gettime)>);
-    REGISTER_SYSCALL_IMPL_X64(preadv, SyscallPassthrough5<SYSCALL_DEF(preadv)>);
-    REGISTER_SYSCALL_IMPL_X64(pwritev, SyscallPassthrough5<SYSCALL_DEF(pwritev)>);
+    REGISTER_PASSTHROUGH_X64(fstatfs, 2);
+    REGISTER_PASSTHROUGH_X64(sched_rr_get_interval, 2);
+    REGISTER_PASSTHROUGH_X64(mlockall, 1);
+    REGISTER_PASSTHROUGH_X64(munlockall, 0);
+    REGISTER_PASSTHROUGH_X64(adjtimex, 1);
+    REGISTER_PASSTHROUGH_X64(setrlimit, 2);
+    REGISTER_PASSTHROUGH_X64(settimeofday, 2);
+    REGISTER_PASSTHROUGH_X64(readahead, 3);
+    REGISTER_PASSTHROUGH_X64(futex, 6);
+    REGISTER_PASSTHROUGH_X64(io_getevents, 5);
+    REGISTER_PASSTHROUGH_X64(semtimedop, 4);
+    REGISTER_PASSTHROUGH_X64(timer_create, 3);
+    REGISTER_PASSTHROUGH_X64(timer_settime, 4);
+    REGISTER_PASSTHROUGH_X64(timer_gettime, 2);
+    REGISTER_PASSTHROUGH_X64(clock_settime, 2);
+    REGISTER_PASSTHROUGH_X64(clock_gettime, 2);
+    REGISTER_PASSTHROUGH_X64(clock_getres, 2);
+    REGISTER_PASSTHROUGH_X64(clock_nanosleep, 4);
+    REGISTER_PASSTHROUGH_X64(mq_open, 4);
+    REGISTER_PASSTHROUGH_X64(mq_timedsend, 5);
+    REGISTER_PASSTHROUGH_X64(mq_timedreceive, 5);
+    REGISTER_PASSTHROUGH_X64(mq_notify, 2);
+    REGISTER_PASSTHROUGH_X64(mq_getsetattr, 3);
+    REGISTER_PASSTHROUGH_X64(waitid, 5);
+    REGISTER_PASSTHROUGH_X64(pselect6, 6);
+    REGISTER_PASSTHROUGH_X64(ppoll, 5);
+    REGISTER_PASSTHROUGH_X64(set_robust_list, 2);
+    REGISTER_PASSTHROUGH_X64(get_robust_list, 3);
+    REGISTER_PASSTHROUGH_X64(sync_file_range, 4);
+    REGISTER_PASSTHROUGH_X64(vmsplice, 4);
+    REGISTER_PASSTHROUGH_X64(utimensat, 4);
+    REGISTER_PASSTHROUGH_X64(fallocate, 4);
+    REGISTER_PASSTHROUGH_X64(timerfd_settime, 4);
+    REGISTER_PASSTHROUGH_X64(timerfd_gettime, 2);
+    REGISTER_PASSTHROUGH_X64(preadv, 5);
+    REGISTER_PASSTHROUGH_X64(pwritev, 5);
+    // Conservatively keep signal-sending syscall on the C++ slow path.
     REGISTER_SYSCALL_IMPL_X64(rt_tgsigqueueinfo, SyscallPassthrough4<SYSCALL_DEF(rt_tgsigqueueinfo)>);
-    REGISTER_SYSCALL_IMPL_X64(recvmmsg, SyscallPassthrough5<SYSCALL_DEF(recvmmsg)>);
-    REGISTER_SYSCALL_IMPL_X64(clock_adjtime, SyscallPassthrough2<SYSCALL_DEF(clock_adjtime)>);
-    REGISTER_SYSCALL_IMPL_X64(sendmmsg, SyscallPassthrough4<SYSCALL_DEF(sendmmsg)>);
-    REGISTER_SYSCALL_IMPL_X64(process_vm_readv, SyscallPassthrough6<SYSCALL_DEF(process_vm_readv)>);
-    REGISTER_SYSCALL_IMPL_X64(process_vm_writev, SyscallPassthrough6<SYSCALL_DEF(process_vm_writev)>);
-    REGISTER_SYSCALL_IMPL_X64(preadv2, SyscallPassthrough6<SYSCALL_DEF(preadv2)>);
-    REGISTER_SYSCALL_IMPL_X64(pwritev2, SyscallPassthrough6<SYSCALL_DEF(pwritev2)>);
-    REGISTER_SYSCALL_IMPL_X64(io_pgetevents, SyscallPassthrough6<SYSCALL_DEF(io_pgetevents)>);
+    REGISTER_PASSTHROUGH_X64(recvmmsg, 5);
+    REGISTER_PASSTHROUGH_X64(clock_adjtime, 2);
+    REGISTER_PASSTHROUGH_X64(sendmmsg, 4);
+    REGISTER_PASSTHROUGH_X64(process_vm_readv, 6);
+    REGISTER_PASSTHROUGH_X64(process_vm_writev, 6);
+    REGISTER_PASSTHROUGH_X64(preadv2, 6);
+    REGISTER_PASSTHROUGH_X64(pwritev2, 6);
+    REGISTER_PASSTHROUGH_X64(io_pgetevents, 6);
+    // Conservatively keep signal-sending syscall on the C++ slow path.
     REGISTER_SYSCALL_IMPL_X64(pidfd_send_signal, SyscallPassthrough4<SYSCALL_DEF(pidfd_send_signal)>);
-    REGISTER_SYSCALL_IMPL_X64(process_madvise, SyscallPassthrough5<SYSCALL_DEF(process_madvise)>);
-    REGISTER_SYSCALL_IMPL_X64(fadvise64, SyscallPassthrough4<SYSCALL_DEF(fadvise64)>);
+    REGISTER_PASSTHROUGH_X64(process_madvise, 5);
+    REGISTER_PASSTHROUGH_X64(fadvise64, 4);
     if (Handler->IsHostKernelVersionAtLeast(6, 5, 0)) {
-      REGISTER_SYSCALL_IMPL_X64(cachestat, SyscallPassthrough4<SYSCALL_DEF(cachestat)>);
+      REGISTER_PASSTHROUGH_X64(cachestat, 4);
     } else {
       REGISTER_SYSCALL_IMPL_X64(cachestat, UnimplementedSyscallSafe);
     }
     if (Handler->IsHostKernelVersionAtLeast(6, 6, 0)) {
-      REGISTER_SYSCALL_IMPL_X64(fchmodat2, SyscallPassthrough4<SYSCALL_DEF(fchmodat2)>);
+      REGISTER_PASSTHROUGH_X64(fchmodat2, 4);
     } else {
       REGISTER_SYSCALL_IMPL_X64(fchmodat2, UnimplementedSyscallSafe);
     }
   }
 } // namespace x64
+
+#undef REGISTER_PASSTHROUGH_COMMON
+#undef REGISTER_PASSTHROUGH_X64
 
 namespace x32 {
   void RegisterPassthrough(FEX::HLE::SyscallHandler* Handler) {

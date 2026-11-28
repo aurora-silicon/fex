@@ -15,10 +15,12 @@ $end_info$
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/string.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <span>
 
 namespace FEX::HLE {
 class SignalDelegator;
@@ -43,11 +45,25 @@ public:
   }
 
 
+  std::span<const int16_t> GetDirectPassthroughTable() const override {
+#if defined(ARCHITECTURE_arm64) && !defined(DEBUG_STRACE)
+    if (Is64BitMode()) {
+      return DirectPassthroughTable;
+    }
+#endif
+    return {};
+  }
+
+  /// Unconditional accessor to the x86-64 -> ARM64 direct-passthrough table for tests.
+  std::span<const int16_t> GetX64DirectPassthroughTable() const {
+    return DirectPassthroughTable;
+  }
+
   void RegisterSyscall_64(int SyscallNumber,
 #ifdef DEBUG_STRACE
                           const fextl::string& TraceFormatString,
 #endif
-                          void* SyscallHandler, int ArgumentCount) override {
+                          void* SyscallHandler, int ArgumentCount, int16_t DirectHostSyscall = -1) override {
     auto& Def = Definitions.at(SyscallNumber);
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
     LOGMAN_THROW_A_FMT(Def.Ptr == reinterpret_cast<void*>(&UnimplementedSyscall), "Oops overwriting sysall problem, {}", SyscallNumber);
@@ -57,10 +73,17 @@ public:
 #ifdef DEBUG_STRACE
     Def.StraceFmt = TraceFormatString;
 #endif
+    DirectPassthroughTable.at(SyscallNumber) = DirectHostSyscall;
   }
 
 private:
   void RegisterSyscallHandlers();
+
+  std::array<int16_t, SYSCALL_x64_MAX> DirectPassthroughTable = [] {
+    std::array<int16_t, SYSCALL_x64_MAX> Table;
+    Table.fill(-1);
+    return Table;
+  }();
 };
 
 fextl::unique_ptr<FEX::HLE::SyscallHandler>
@@ -76,7 +99,8 @@ CreateHandler(FEXCore::Context::Context* ctx, FEX::HLE::SignalDelegator* _Signal
 // Deduces return, args... from the function passed
 // Does not work with lambas, because they are objects with operator (), not functions
 template<typename R, typename... Args>
-void RegisterSyscall(SyscallHandler* Handler, int SyscallNumber, const char* Name, R (*fn)(FEXCore::Core::CpuStateFrame* Frame, Args...)) {
+void RegisterSyscall(SyscallHandler* Handler, int SyscallNumber, const char* Name,
+                     R (*fn)(FEXCore::Core::CpuStateFrame* Frame, Args...), int16_t DirectHostSyscall = -1) {
 #ifdef DEBUG_STRACE
   auto TraceFormatString = fextl::string(Name) + "(" + CollectArgsFmtString<Args...>() + ") = {}";
 #endif
@@ -84,15 +108,15 @@ void RegisterSyscall(SyscallHandler* Handler, int SyscallNumber, const char* Nam
 #ifdef DEBUG_STRACE
                               TraceFormatString,
 #endif
-                              reinterpret_cast<void*>(fn), sizeof...(Args));
+                              reinterpret_cast<void*>(fn), sizeof...(Args), DirectHostSyscall);
 }
 
 // Generic RegisterSyscall for lambdas
 // Non-capturing lambdas can be cast to function pointers, but this does not happen on argument matching
 // This is some glue logic that will cast a lambda and call the base RegisterSyscall implementation
 template<class F>
-void RegisterSyscall(SyscallHandler* _Handler, int num, const char* name, F f) {
-  RegisterSyscall(_Handler, num, name, +f);
+void RegisterSyscall(SyscallHandler* _Handler, int num, const char* name, F f, int16_t DirectHostSyscall = -1) {
+  RegisterSyscall(_Handler, num, name, +f, DirectHostSyscall);
 }
 
 void RegisterEpoll(FEX::HLE::SyscallHandler* Handler);
