@@ -175,6 +175,8 @@ private:
   template<bool kDryRun>
   [[gnu::always_inline]] bool EliminateDeadCode(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
+  template<bool kAPFLG>
+  void FoldNegImmAddSub(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp, uint32_t LiveFlags);
   CondClass X86ToArmFloatCond(CondClass X86);
   // kSolve: SolveFromNothingLive, which also narrows LoadNZCV reads and, with
   // kDryRun, computes the result without changing the IR (APFLG only).
@@ -708,6 +710,65 @@ void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView&
   IREmit->Remove(CurrentIR.GetNode(PrevWrap));
 }
 
+template<bool kAPFLG>
+void DeadFlagCalculationEliminination::FoldNegImmAddSub(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp,
+                                                        uint32_t LiveFlags) {
+  if (IROp->Size < OpSize::i32Bit) {
+    return;
+  }
+
+  IROps FlippedOp;
+  bool IsNonFlagOp = false;
+  switch (IROp->Op) {
+  case OP_ADD:
+    FlippedOp = OP_SUB;
+    IsNonFlagOp = true;
+    break;
+  case OP_SUB:
+    FlippedOp = OP_ADD;
+    IsNonFlagOp = true;
+    break;
+  case OP_ADDWITHFLAGS: FlippedOp = OP_SUBWITHFLAGS; break;
+  case OP_SUBWITHFLAGS: FlippedOp = OP_ADDWITHFLAGS; break;
+  case OP_ADDNZCV: FlippedOp = OP_SUBNZCV; break;
+  case OP_SUBNZCV: FlippedOp = OP_ADDNZCV; break;
+  default: return;
+  }
+
+  // ALUOps.cpp requires Src1 to be a real GPR when Src2 is an inline constant.
+  const auto Src1Op = CurrentIR.GetOp<IROp_Header>(IROp->Args[0])->Op;
+  if (Src1Op == OP_INLINECONSTANT || Src1Op == OP_INLINEENTRYPOINTOFFSET) {
+    return;
+  }
+
+  const auto Src2Header = CurrentIR.GetOp<IROp_Header>(IROp->Args[1]);
+  if (Src2Header->Op != OP_CONSTANT) {
+    return;
+  }
+
+  const uint64_t Val = Src2Header->C<IR::IROp_Constant>()->Constant;
+  const int64_t SignedVal = IROp->Size == OpSize::i32Bit ? static_cast<int64_t>(static_cast<int32_t>(Val)) : static_cast<int64_t>(Val);
+  if (SignedVal >= 0) {
+    return;
+  }
+
+  const uint64_t AbsVal = 0ULL - static_cast<uint64_t>(SignedVal);
+  if (!ARMEmitter::IsImmAddSub(AbsVal)) {
+    return;
+  }
+
+  // Flipping ADD/SUB with a negative immediate preserves NZCV and PF, but changes
+  // hardware AF unless the low 4 bits of the immediate are zero (no nibble carry/borrow).
+  if (!IsNonFlagOp && kAPFLG && (LiveFlags & FLAG_A) && (AbsVal & 0xF) != 0) {
+    return;
+  }
+
+  IROp->Op = FlippedOp;
+  IREmit->SetWriteCursorBefore(CodeNode);
+  Ref NewImm = IREmit->_InlineConstant(AbsVal);
+  IREmit->ReplaceNodeArgument(CodeNode, 1, NewImm);
+}
+
 /**
  * @brief This pass removes dead code locally.
  */
@@ -787,6 +848,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         }
       }
 
+      const uint32_t PreFlagsRead = FlagsRead;
       bool Eliminated = false;
       if (!Info.Trivial()) {
         if ((FlagsRead & Info.Write()) == 0) {
@@ -816,6 +878,12 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         // iteration.
         if (!Eliminated) {
           FlagsRead |= Info.Read();
+        }
+      }
+
+      if constexpr (!kDryRun) {
+        if (!Eliminated) {
+          FoldNegImmAddSub<kAPFLG>(IREmit, CurrentIR, CodeNode, IROp, PreFlagsRead);
         }
       }
 
@@ -1010,6 +1078,7 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   }
 
   if (APFLG && Scratch.WriteBack && CFG.BlockMap.size() > 1) {
+    CurrentIR = IREmit->ViewIR();
     SolveFromNothingLive(IREmit, CurrentIR, CFG);
   }
 

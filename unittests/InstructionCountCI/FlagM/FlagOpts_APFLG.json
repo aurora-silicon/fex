@@ -1,0 +1,166 @@
+{
+  "Features": {
+    "Bitness": 64,
+    "EnabledHostFeatures": [
+      "FLAGM",
+      "FLAGM2",
+      "APFLG"
+    ],
+    "DisabledHostFeatures": [
+      "SVE128",
+      "SVE256",
+      "AFP"
+    ],
+    "BinaryCacheVersion": 47
+  },
+  "Instructions": {
+    "APFLG cmp -1; je": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 4,
+      "x86Insts": [
+        "cmp eax, -1",
+        "je .t",
+        "nop",
+        ".t: xor ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "cmn w4, #0x1 (1)",
+        "b.eq #+0x4",
+        "cmp w7, w7",
+        "mov w7, #0x0"
+      ]
+    },
+    "APFLG add -1; jnz": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 4,
+      "x86Insts": [
+        "add eax, -1",
+        "jnz .t",
+        "nop",
+        ".t: xor ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "subs w4, w4, #0x1 (1)",
+        "b.ne #+0x4",
+        "cmp w7, w7",
+        "mov w7, #0x0"
+      ]
+    },
+    "APFLG add rsp, -0x20": {
+      "x86InstructionCount": 1,
+      "ExpectedInstructionCount": 2,
+      "x86Insts": [
+        "add rsp, -0x20"
+      ],
+      "ExpectedArm64ASM": [
+        "subs x8, x8, #0x20 (32)",
+        "cfinv"
+      ]
+    },
+    "APFLG sub rsp, -0x20": {
+      "x86InstructionCount": 1,
+      "ExpectedInstructionCount": 1,
+      "x86Insts": [
+        "sub rsp, -0x20"
+      ],
+      "ExpectedArm64ASM": [
+        "adds x8, x8, #0x20 (32)"
+      ]
+    },
+    "APFLG add eax, -1 (flags dead)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 3,
+      "x86Insts": [
+        "add eax, -1",
+        "xor ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "sub w4, w4, #0x1 (1)",
+        "cmp w7, w7",
+        "mov w7, #0x0"
+      ]
+    },
+    "APFLG add eax, -1; lahf (must not fold)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 13,
+      "x86Insts": [
+        "add eax, -1",
+        "lahf"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0xffffffff",
+        "adds w4, w4, w20",
+        "cset x20, hs",
+        "mrs x21, nzcv",
+        "ubfx w22, w21, #26, #1",
+        "orr x20, x20, x22, lsl #2",
+        "ubfx w22, w21, #27, #1",
+        "orr x20, x20, x22, lsl #4",
+        "and x21, x21, #0xc0000000",
+        "orr x20, x20, x21, lsr #24",
+        "orr x20, x20, #0x2",
+        "bfi x4, x20, #8, #8",
+        "cfinv"
+      ]
+    },
+    "APFLG sub edx, -31; lahf (must not fold)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 12,
+      "x86Insts": [
+        "sub edx, -31",
+        "lahf"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0xffffffe1",
+        "subs w5, w5, w20",
+        "cset x20, lo",
+        "mrs x21, nzcv",
+        "ubfx w22, w21, #26, #1",
+        "orr x20, x20, x22, lsl #2",
+        "ubfx w22, w21, #27, #1",
+        "orr x20, x20, x22, lsl #4",
+        "and x21, x21, #0xc0000000",
+        "orr x20, x20, x21, lsr #24",
+        "orr x20, x20, #0x2",
+        "bfi x4, x20, #8, #8"
+      ]
+    },
+    "APFLG add rdi, -31; lahf (must not fold)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 13,
+      "x86Insts": [
+        "add rdi, -31",
+        "lahf"
+      ],
+      "ExpectedArm64ASM": [
+        "mov x20, #0xffffffffffffffe1",
+        "adds x11, x11, x20",
+        "cset x20, hs",
+        "mrs x21, nzcv",
+        "ubfx w22, w21, #26, #1",
+        "orr x20, x20, x22, lsl #2",
+        "ubfx w22, w21, #27, #1",
+        "orr x20, x20, x22, lsl #4",
+        "and x21, x21, #0xc0000000",
+        "orr x20, x20, x21, lsr #24",
+        "orr x20, x20, #0x2",
+        "bfi x4, x20, #8, #8",
+        "cfinv"
+      ]
+    },
+    "APFLG add eax, INT32_MIN (must not fold)": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 4,
+      "x86Insts": [
+        "add eax, -2147483648",
+        "xor ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x80000000",
+        "add w4, w4, w20",
+        "cmp w7, w7",
+        "mov w7, #0x0"
+      ]
+    }
+  }
+}
