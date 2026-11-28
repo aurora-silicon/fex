@@ -1335,10 +1335,13 @@ DEF_OP(FindLSB) {
   const auto Dst = GetReg(Node);
   const auto Src = GetReg(Op->Src);
 
-  // We assume the source is nonzero, so we can just rbit+clz without worrying
-  // about upper garbage for smaller types.
-  rbit(EmitSize, TMP1, Src);
-  clz(EmitSize, Dst, TMP1);
+  // We assume the source is nonzero, so we can ignore upper garbage for smaller types.
+  if (CTX->HostFeatures.SupportsCSSC) {
+    ctz(EmitSize, Dst, Src);
+  } else {
+    rbit(EmitSize, TMP1, Src);
+    clz(EmitSize, Dst, TMP1);
+  }
 }
 
 DEF_OP(FindMSB) {
@@ -1374,6 +1377,18 @@ DEF_OP(FindTrailingZeroes) {
 
   const auto Dst = GetReg(Node);
   const auto Src = GetReg(Op->Src);
+
+  if (CTX->HostFeatures.SupportsCSSC) {
+    if (OpSize == IR::OpSize::i16Bit) {
+      // Setting bit 16 ensures zero (masked) inputs return 16 and ignores upper
+      // garbage in Src without explicitly masking.
+      orr(EmitSize, Dst, Src, 0x10000);
+      ctz(EmitSize, Dst, Dst);
+    } else {
+      ctz(EmitSize, Dst, Src);
+    }
+    return;
+  }
 
   rbit(EmitSize, Dst, Src);
 

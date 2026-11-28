@@ -11,7 +11,8 @@
       "SVE128",
       "SVE256",
       "RPRES",
-      "AFP"
+      "AFP",
+      "CSSC"
     ],
     "BinaryCacheVersion": 47
   },

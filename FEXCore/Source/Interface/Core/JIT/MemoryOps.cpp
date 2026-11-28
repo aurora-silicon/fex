@@ -2348,16 +2348,20 @@ DEF_OP(MemCpy) {
         msr(ARMEmitter::SystemRegister::NZCV, TMP4);
       }
 
-      ARMEmitter::ForwardLabel AbsPos {};
       ARMEmitter::ForwardLabel AgainInternal256Exit {};
       ARMEmitter::ForwardLabel AgainInternal128Exit {};
       ARMEmitter::BackwardLabel AgainInternal128 {};
       ARMEmitter::BackwardLabel AgainInternal256 {};
 
       sub(ARMEmitter::Size::i64Bit, TMP4, TMP2, TMP3);
-      (void)tbz(TMP4, 63, &AbsPos);
-      neg(ARMEmitter::Size::i64Bit, TMP4, TMP4);
-      (void)Bind(&AbsPos);
+      if (CTX->HostFeatures.SupportsCSSC) {
+        abs(ARMEmitter::Size::i64Bit, TMP4, TMP4);
+      } else {
+        ARMEmitter::ForwardLabel AbsPos {};
+        (void)tbz(TMP4, 63, &AbsPos);
+        neg(ARMEmitter::Size::i64Bit, TMP4, TMP4);
+        (void)Bind(&AbsPos);
+      }
       sub(ARMEmitter::Size::i64Bit, TMP4, TMP4, 32);
       (void)tbnz(TMP4, 63, &AgainInternal);
 
