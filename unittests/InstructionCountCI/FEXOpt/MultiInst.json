@@ -37,7 +37,7 @@
     },
     "signed div narrow": {
       "x86InstructionCount": 2,
-      "ExpectedInstructionCount": 5,
+      "ExpectedInstructionCount": 4,
       "Comment": [
         "div narrowing with known smaller sources",
         "dividend in rdx:rax"
@@ -49,14 +49,13 @@
       "ExpectedArm64ASM": [
         "asr x5, x4, #63",
         "sdiv x20, x4, x7",
-        "msub x22, x20, x7, x4",
-        "mov x5, x22",
+        "msub x5, x20, x7, x4",
         "mov x4, x20"
       ]
     },
     "unsigned div narrow": {
       "x86InstructionCount": 2,
-      "ExpectedInstructionCount": 5,
+      "ExpectedInstructionCount": 4,
       "Comment": [
         "div narrowing with known smaller sources",
         "dividend in rdx:rax"
@@ -68,14 +67,13 @@
       "ExpectedArm64ASM": [
         "mov w5, #0x0",
         "udiv x20, x4, x7",
-        "msub x22, x20, x7, x4",
-        "mov x5, x22",
+        "msub x5, x20, x7, x4",
         "mov x4, x20"
       ]
     },
     "unsigned div narrow with flags": {
       "x86InstructionCount": 2,
-      "ExpectedInstructionCount": 6,
+      "ExpectedInstructionCount": 5,
       "Comment": [
         "div narrowing with known smaller sources",
         "dividend in rdx:rax"
@@ -88,14 +86,13 @@
         "subs w26, w5, w5",
         "mov w5, #0x0",
         "udiv x20, x4, x7",
-        "msub x22, x20, x7, x4",
-        "mov x5, x22",
+        "msub x5, x20, x7, x4",
         "mov x4, x20"
       ]
     },
     "signed div narrow 32-bit": {
       "x86InstructionCount": 3,
-      "ExpectedInstructionCount": 10,
+      "ExpectedInstructionCount": 5,
       "x86Insts": [
         "mov    eax, edi",
         "cdq",
@@ -104,19 +101,14 @@
       "ExpectedArm64ASM": [
         "mov w4, w11",
         "asr w5, w4, #31",
-        "mov w20, w10",
-        "mov x0, x4",
-        "bfi x0, x5, #32, #32",
-        "sxtw x1, w20",
-        "sdiv x22, x0, x1",
-        "msub x21, x22, x1, x0",
-        "mov w4, w22",
-        "mov w5, w21"
+        "sdiv w20, w4, w10",
+        "msub w5, w20, w10, w4",
+        "mov x4, x20"
       ]
     },
     "unsigned div narrow 32-bit": {
       "x86InstructionCount": 3,
-      "ExpectedInstructionCount": 7,
+      "ExpectedInstructionCount": 6,
       "x86Insts": [
         "mov    eax, edi",
         "xor    edx, edx",
@@ -127,9 +119,81 @@
         "subs w26, w5, w5",
         "mov w5, #0x0",
         "udiv w20, w4, w10",
-        "msub w22, w20, w10, w4",
+        "msub w5, w20, w10, w4",
+        "mov x4, x20"
+      ]
+    },
+    "signed div narrow mem": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 5,
+      "x86Insts": [
+        "cqo",
+        "idiv qword [rdi]"
+      ],
+      "ExpectedArm64ASM": [
+        "asr x5, x4, #63",
+        "ldr x20, [x11]",
+        "sdiv x22, x4, x20",
+        "msub x5, x22, x20, x4",
+        "mov x4, x22"
+      ]
+    },
+    "unsigned div narrow 32-bit mem": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 6,
+      "x86Insts": [
+        "xor edx, edx",
+        "div dword [rdi]"
+      ],
+      "ExpectedArm64ASM": [
+        "subs w26, w5, w5",
+        "mov w5, #0x0",
+        "ldr w20, [x11]",
+        "udiv w22, w4, w20",
+        "msub w5, w22, w20, w4",
+        "mov x4, x22"
+      ]
+    },
+    "signed div narrow 32-bit intervening": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 8,
+      "x86Insts": [
+        "cdq",
+        "add rcx, 1",
+        "idiv ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "asr w5, w4, #31",
+        "adds x26, x7, #0x1 (1)",
+        "mov x27, x7",
+        "mov x7, x26",
+        "sdiv w20, w4, w7",
+        "msub w5, w20, w7, w4",
+        "cfinv",
+        "mov x4, x20"
+      ]
+    },
+    "signed div 32-bit rax clobbered (must not narrow)": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 12,
+      "x86Insts": [
+        "cdq",
+        "add eax, 1",
+        "idiv ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "asr w5, w4, #31",
+        "adds w26, w4, #0x1 (1)",
+        "mov x27, x4",
+        "mov x4, x26",
+        "mov x0, x4",
+        "bfi x0, x5, #32, #32",
+        "sxtw x1, w7",
+        "sdiv x20, x0, x1",
+        "msub x22, x20, x1, x0",
         "mov w4, w20",
-        "mov w5, w22"
+        "mov w5, w22",
+        "cfinv"
       ]
     },
     "push ax, bx": {

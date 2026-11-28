@@ -2852,17 +2852,16 @@
       ]
     },
     "idiv ebx": {
-      "ExpectedInstructionCount": 8,
+      "ExpectedInstructionCount": 7,
       "Comment": "GROUP2 0xf7 /7",
       "ExpectedArm64ASM": [
-        "mov w20, w6",
         "mov x0, x4",
         "bfi x0, x5, #32, #32",
-        "sxtw x1, w20",
-        "sdiv x22, x0, x1",
-        "msub x21, x22, x1, x0",
-        "mov w4, w22",
-        "mov w5, w21"
+        "sxtw x1, w6",
+        "sdiv x20, x0, x1",
+        "msub x22, x20, x1, x0",
+        "mov w4, w20",
+        "mov w5, w22"
       ]
     },
     "idiv rbx": {

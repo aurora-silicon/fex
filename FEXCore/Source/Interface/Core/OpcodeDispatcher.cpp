@@ -3909,13 +3909,23 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
     StoreGPRRegister(X86State::REG_RAX, ResultAX, OpSize::i16Bit);
   } else {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
-    Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
+    bool NarrowUpper = false;
+    if (Size >= OpSize::i32Bit) {
+      uint64_t RDXConst {};
+      const Ref RDXDef = RegCache.LastDef[GPR0Index + X86State::REG_RDX];
+      if (RDXDef && IsValueConstant(WrapNode(RDXDef), &RDXConst) && RDXConst == 0) {
+        NarrowUpper = true;
+      }
+    }
 
-    _UDiv(Size, Src1, Src2, Divisor, Quotient, Remainder);
+    Ref Upper = NarrowUpper ? Invalid() : LoadGPRRegister(X86State::REG_RDX);
+    _UDiv(Size, Src1, Upper, Divisor, Quotient, Remainder);
 
     if (Size == OpSize::i32Bit) {
-      Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      if (!NarrowUpper) {
+        Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      }
       Size = OpSize::iInvalid;
     }
 
@@ -3929,11 +3939,11 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
-  // This loads the divisor
-  Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags);
-
   const auto GPRSize = GetGPROpSize();
   auto Size = OpSizeFromSrc(Op);
+
+  // This loads the divisor. 32-bit/64-bit paths mask inside the JIT, 8/16 do not.
+  Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = Size >= OpSize::i32Bit});
 
   if (Size == OpSize::i64Bit && !Is64BitMode) {
     LogMan::Msg::EFmt("Doesn't exist in 32bit mode");
@@ -3956,13 +3966,32 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
     StoreGPRRegister(X86State::REG_RAX, ResultAX, OpSize::i16Bit);
   } else {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
-    Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
+    bool NarrowUpper = false;
+    if (Size >= OpSize::i32Bit) {
+      constexpr uint8_t RAXIndex = GPR0Index + X86State::REG_RAX;
+      constexpr uint8_t RDXIndex = GPR0Index + X86State::REG_RDX;
+      const Ref RDXDef = RegCache.LastDef[RDXIndex];
+      const bool RAXUnchanged = !RegCache.LastDef[RAXIndex] || RegCache.LastDefIndex[RAXIndex] < RegCache.LastDefIndex[RDXIndex];
+      if (RDXDef && RAXUnchanged) {
+        const auto* Header = GetOpHeader(WrapNode(RDXDef));
+        if (Header->Op == OP_SBFE && Header->Size == Size) {
+          const auto* Sbfe = Header->C<IR::IROp_Sbfe>();
+          if (Sbfe->Width == 1 && Sbfe->lsb == IR::OpSizeAsBits(Size) - 1 &&
+              (Sbfe->Src == WrapNode(Src1) || IsValueLoadRegister(Sbfe->Src, RegClass::GPR, X86State::REG_RAX))) {
+            NarrowUpper = true;
+          }
+        }
+      }
+    }
 
-    _Div(Size, Src1, Src2, Divisor, Quotient, Remainder);
+    Ref Upper = NarrowUpper ? Invalid() : LoadGPRRegister(X86State::REG_RDX);
+    _Div(Size, Src1, Upper, Divisor, Quotient, Remainder);
 
     if (Size == OpSize::i32Bit) {
-      Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      if (!NarrowUpper) {
+        Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      }
       Size = OpSize::iInvalid;
     }
 
